@@ -2,7 +2,6 @@
 
 
 
-
 /* -------------------------------------------------------------------------------------------------------------------------------- */
 /* ---- Prototipo de funciones estáticas ------------------------------------------------------------------------------------------ */
 // ==== Logger ==== //
@@ -11,7 +10,20 @@ static void _server_logger_deinit(struct server_logger * logger);
 static void _server_logger_conf(struct server_logger * logger, struct server_logger_conf * logger_conf);
 static void _server_log(struct server_logger * logger, enum server_logger_level log_level, const char * log_msg);
 
-// ==== TCP/IP + TLS ==== //
+// ==== Conn ==== //
+static void _server_conn_conf(struct server_conn * conn, struct server_conn_conf * conn_conf);
+static bool _server_conn_init(struct server_conn * conn);
+static void _server_conn_deinit(struct server_conn * conn);
+
+// ==== Worker ==== //
+static bool _server_worker_conf(struct server_worker * workers, struct server_worker_conf * workers_conf);
+static void _server_worker_deinit(struct server_worker * worker);
+static bool _server_worker_launch(struct server_worker * worker);
+static void _server_worker_wait_land(struct server_worker * worker);
+
+// ==== Hilos ==== //
+static void * __server_main_worker(void * arg);
+static void * __server_cli_worker(void * arg);
 /* -------------------------------------------------------------------------------------------------------------------------------- */
 /* -------------------------------------------------------------------------------------------------------------------------------- */
 
@@ -30,7 +42,7 @@ static void _server_log(struct server_logger * logger, enum server_logger_level 
 /* ---- Implementación de funciones estáticas ------------------------------------------------------------------------------------- */
 
 // ================================================================ //
-// Logger del servidor
+// Logger del servidor.
 // ================================================================ //
 static void __server_log_genname(struct server_logger * logger, char * buffer, size_t buffer_len);
 static void __server_log_rotfile(struct server_logger * logger);
@@ -40,7 +52,7 @@ static void __server_log_rotfile(struct server_logger * logger);
 
     @param struct server_logger * logger: Referencia al logger del servidor.
 
-    @retval true: Error en la inicialización del logger
+    @retval true: Error en la inicialización del logger.
     @retval false: No han ocurrido errores.
 */
 static bool _server_logger_init(struct server_logger * logger){
@@ -101,6 +113,7 @@ static void _server_logger_deinit(struct server_logger * logger){
 
 /*
     @brief Función para configurar los parámetros básicos del logger del servidor.
+    @note: Pensada para ser usada tras inicializar el logger!
 
     @param struct server_logger * logger: Referencia al logger del servidor.
     @param struct server_logger_conf logger_conf: Estructura de datos con la configuración deseada.
@@ -256,8 +269,380 @@ static void __server_log_rotfile(struct server_logger * logger){
 }
 
 // ================================================================ //
-// TCP/IP + TLS: Creación y gestión de conexiones.
+// Conexión del servidor.
 // ================================================================ //
+/*
+    @brief Función para configurar puerto y rutas a certificado y clave del servidor.
+    @note Obligatoria antes de _server_conn_init().
 
+    @param struct server_conn * conn: Referencia a la estructura de conexión del servidor.
+    @param struct server_conn_conf * conn_conf: Referencia a la estructura de configuración de conexión.
+
+    @retval None.
+*/
+static void _server_conn_conf(struct server_conn * conn, struct server_conn_conf * conn_conf){
+    // Comprobación de estructuras válidas:
+    if (!conn) return;
+    if (!conn_conf) return;
+
+    // Asignación del puerto del servidor configurado (o puerto por defecto):
+    conn->port = (conn_conf->port >= MIN_CONN_PORT_NUMBER) ? conn_conf->port : DEFAULT_CONN_PORT;
+
+    // Asignación de las rutas completas hacia el certificad y clave privada del servidor:
+    if (conn_conf->cert_path)
+        conn->cert_path = strdup(conn_conf->cert_path);
+    else 
+        conn->cert_path = strdup(DEFAULT_CONN_CERT_PATH);
+
+
+    if (conn_conf->key_path)
+        conn->key_path = strdup(conn_conf->key_path);
+    else
+        conn->key_path = strdup(DEFAULT_CONN_KEY_PATH);
+}
+
+/*
+    @brief Función para inicializar el servidor (socket tcp/ip y capa tls).
+
+    @param struct server_conn * conn: Estructura de datos de la conexión del servidor.
+
+    @retval true: Error en la inicialización del servidor.
+    @retval false: No han ocurrido errores.
+*/
+static bool _server_conn_init(struct server_conn * conn){
+    // Comprobación de etructura de conexión válida:
+    if (!conn) return true;
+    if (conn->port < MIN_CONN_PORT_NUMBER) return true;
+    if (!conn->cert_path) return true;
+    if (!conn->key_path) return true;
+
+    // Creación del socket TCP:
+    conn->fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (conn->fd < 0) return true;
+
+    // Socket en modo no bloqueante:
+    int flags = fcntl(conn->fd, F_GETFL, 0);
+    if (flags < 0) return true;
+    if (fcntl(conn->fd, F_SETFL, flags | O_NONBLOCK) < 0) return true;
+
+    // Reusar dirección (evita esperar la liberación del puerto cuando el servidor se reinicia):
+    int opt = 1;
+    setsockopt(conn->fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    // Asigna la estructura de conexión con los datos de dirección y puerto:
+    memset(&conn->addr, 0, sizeof(conn->addr));
+    conn->addr.sin_addr.s_addr = INADDR_ANY;
+    conn->addr.sin_port = htons(conn->port);
+    conn->addr.sin_family = AF_INET;
+
+    // Se une la estructura de conexión con el socket:
+    if(bind(conn->fd, (struct sockaddr *)&conn->addr, sizeof(conn->addr)) < 0){
+        close(conn->fd);
+        return true;
+    }
+
+    // Se establece el socket en escucha:
+    if(listen(conn->fd, SOMAXCONN) < 0){
+        close(conn->fd);
+        return true;
+    }
+
+    // Inicialización de la capa TLS:
+    SSL_library_init();
+    SSL_load_error_strings();
+    OpenSSL_add_all_algorithms();
+
+    // Establecimiento del método de cifrado y creación del contexto del servidor:
+    conn->ssl_method = TLS_server_method();
+    conn->ssl_ctx = SSL_CTX_new(conn->ssl_method);
+    if (!conn->ssl_ctx){
+        close(conn->fd);
+        return true;
+    }
+
+    // Carga de certificado y clave:
+    if (SSL_CTX_use_certificate_file(conn->ssl_ctx, conn->cert_path, SSL_FILETYPE_PEM) <= 0 ||
+    SSL_CTX_use_PrivateKey_file(conn->ssl_ctx, conn->key_path, SSL_FILETYPE_PEM) <= 0 ||
+    !SSL_CTX_check_private_key(conn->ssl_ctx)){
+        SSL_CTX_free(conn->ssl_ctx);
+        close(conn->fd);
+        return true;
+    }
+
+    return false;
+}
+
+/*
+    @brief Función para deinicializar la estructura de conexión del servidor y liberar memoria reservada en la estructura.
+
+    @param struct server_conn * conn: Referencia a la estructura de conexión del servidor.
+
+    @retval None.
+*/
+static void _server_conn_deinit(struct server_conn * conn){
+    // Comprobación de estructura válida:
+    if (!conn) return;
+
+    // Liberación del contexto tls y cierre del socket:
+    if (conn->ssl_ctx) SSL_CTX_free(conn->ssl_ctx);
+    if (conn->fd >= 0) close(conn->fd);
+
+    // Liberación de memoria de las rutas de certificado y clave:
+    if (conn->cert_path){
+        free(conn->cert_path);
+        conn->cert_path = NULL;
+    }
+    if (conn->key_path){
+        free(conn->key_path);
+        conn->key_path = NULL;
+    }  
+}
+
+// ================================================================ //
+// Worker.
+// ================================================================ //
+static void * __server_main_worker(void * arg);
+static void * __server_cli_worker(void * arg);
+
+/*
+    @brief Función para crear y configurar parámetros básicos de los hilos de trabajo del servidor.
+    @note Esta función sirve como inicializadora de los worker y sus miembros, su uso es obligatorio.
+
+    @param struct server_workers * workers: Referencia a la estructura de datos de los hilos del servidor.
+    @param struct server_workers * workers_conf: Referencia a los datos de configuración.
+
+    @retval true: Error en la inicialización de workers del servidor.
+    @retval false: No han ocurrido errores.
+*/
+static bool _server_worker_conf(struct server_worker * worker, struct server_worker_conf * worker_conf){
+    // Comprobación de estructuras válidas:
+    if (worker == NULL) return true;
+    if (worker_conf == NULL) return true;
+
+    // Se desinicializa la estrucutra de workers (assegura punteros a NULL antes de inicializar):
+    _server_worker_deinit(worker);
+
+    // Asignación de valores configurados (o por defecto si no se dan - miembros estáticos):
+    worker->num_workers = (worker_conf->num_workers > 0) ? worker_conf->num_workers : DEFAULT_NUM_WORKERS;
+    worker->client_capacity_block = (worker_conf->client_capacity_block > 0) ? worker_conf->client_capacity_block : DEFAULT_CLIENT_CAPACITY_BLOCK;
+    worker->client_read_buffer_size = (worker_conf->client_read_buffer_size > 0) ? worker_conf->client_read_buffer_size : DEFAULT_CLIENT_READ_BUFFER_SIZE;
+    worker->client_write_buffer_size = (worker_conf->client_write_buffer_size > 0) ? worker_conf->client_write_buffer_size : DEFAULT_CLIENT_WRITE_BUFFER_SIZE;
+    worker->client_timeout = (worker_conf->client_timeout > 0) ? worker_conf->client_timeout : DEFAULT_CLIENT_TIMEOUT;
+
+    // Asignación de valores configurados (o por defecto - miembros dinámicos):
+    worker->client_ctx = malloc(sizeof(struct server_client_ctx) * worker->num_workers);
+    if (!worker->client_ctx) return true;
+
+    worker->client_capacity = calloc(worker->num_workers, sizeof(size_t));
+    if (!worker->client_capacity){
+        _server_worker_deinit(worker);
+        return true;
+    }
+
+    worker->client_count = calloc(worker->num_workers, sizeof(size_t));
+    if (!worker->client_count){
+        _server_worker_deinit(worker);
+        return true;
+    }
+
+    worker->client = calloc(worker->num_workers, sizeof(struct server_client_conn *));
+    if (!worker->client){
+        _server_worker_deinit(worker);
+        return true;
+    }
+
+    for (size_t i = 0; i < worker->num_workers; i++){
+        worker->client[i] = calloc(worker->client_capacity_block, sizeof(struct server_client_conn));
+        worker->client_capacity[i] = worker->client_capacity_block;
+        worker->client_ctx[i].server_worker = worker;
+        worker->client_ctx[i].client_index = i;
+        if (worker->client[i]) continue;
+        _server_worker_deinit(worker);
+        return true;
+    }
+
+    worker->epoll_fd = calloc(worker->num_workers, sizeof(int));
+    if (!worker->epoll_fd){
+        _server_worker_deinit(worker);
+        return true;
+    }
+    for (size_t i = 0; i < worker->num_workers; i++){
+        worker->epoll_fd[i] = -1;
+    }
+
+    for (size_t i = 0; i < worker->num_workers; i++){
+        worker->epoll_fd[i] = epoll_create1(0);
+        if (worker->epoll_fd[i] == -1){
+            _server_worker_deinit(worker);
+            return true;
+        }
+    }
+
+    worker->thread = calloc(worker->num_workers, sizeof(pthread_t));
+    if (!worker->thread){
+        _server_worker_deinit(worker);
+        return true;
+    }
+
+
+
+    return false;
+}
+
+/*
+    @brief Función para desinicializar y liberar la memoria usada por los hilos del servidor.
+    @note: Los hilos deben ser detenidos previamente a la llamada de este servidor!
+
+    @param struct server_worker * worker: Referencia a la estructura global de los hilos.
+
+    @retval None.
+*/
+static void _server_worker_deinit(struct server_worker * worker){
+    // Comprobación de referencia válida:
+    if (worker == NULL) return;
+
+    // Liberación de memoria:
+    for (size_t i = 0; i < worker->num_workers; i++){
+        if (worker->epoll_fd && (worker->epoll_fd[i] != -1)){
+            close(worker->epoll_fd[i]);
+            worker->epoll_fd[i] = -1;
+        }
+
+        if (worker->client[i]) free(worker->client[i]);
+        if (worker->client[i]) worker->client[i] = NULL;
+    }
+    if (worker->client_ctx) free(worker->client_ctx);
+    worker->client_ctx = NULL;
+    if (worker->client_count) free(worker->client_count);
+    worker->client_count = NULL;
+    if (worker->client_capacity) free(worker->client_capacity);
+    worker->client_capacity = NULL;
+    if (worker->client) free(worker->client);
+    worker->client = NULL; 
+    if (worker->epoll_fd) free(worker->epoll_fd);
+    worker->epoll_fd = NULL;
+    if (worker->thread) free(worker->thread);
+    worker->thread = NULL;
+}
+
+/*
+    @brief Función para lanzar la ejecución (no bloqueante) de los hilos del servidor.
+
+    @param struct server_worker * worker: Referencia al worker que gestionará los hilos del servidor.
+
+    @retval true: Error en la inicialización de workers del servidor.
+    @retval false: No han ocurrido errores.
+*/
+static bool _server_worker_launch(struct server_worker * worker){
+    // Comprobación de worker válido:
+    if (!worker) return true;
+
+    // Lanzamiento de los hilos que gestionan los clientes:
+    for (size_t i = 0; i < worker->num_workers; i++){
+
+        if(pthread_create(&worker->thread[i], NULL, __server_cli_worker, (void *)&worker->client_ctx[i]) == 0) continue;
+        for (ssize_t j = (ssize_t)i-1; j >= 0; j--){
+            pthread_cancel(worker->thread[j]);
+        }
+        return true;
+    }
+
+    // Lanzamiento del hilo que gestiona las conexiones:
+    if(pthread_create(&worker->main_thread, NULL, __server_main_worker, (void *)worker) != 0){
+        for (size_t i = 0; i < worker->num_workers; i++){
+            pthread_cancel(worker->thread[i]);
+        }
+        return true;
+    }
+
+    return false;
+}
+
+/*
+    @brief Función para esperar la detención de los hilos del servidor.
+    @note Bloquea la ejecución del hilo que lo llama, y está pensado para ser llamado antes de liberar
+    recursos como seguridad adicional. 
+    @note Para la detención de los hilos, se deberá cambiar el estado del servidor de SERVER_STATE_RUNNING a SERVER_STATE_CLOSING, de
+    manera externa a esta función. En caso de que no se de, esta función bloqueará el flujo de ejecución de manera indefinida, 
+    previniendo la ejecución de código que pueda ser peligroso para los hilos en ejecución.
+
+    @param struct server_worker * worker: Referencia al worker del servidor.
+
+    @retval None.
+*/
+static void _server_worker_wait_land(struct server_worker * worker){
+    // Comprobación de referencia válida:
+    if (!worker) return;
+
+    // Se espera al fin de ejecución de los hilos del servidor:
+    for (size_t i = 0; i < worker->num_workers; i++){
+        pthread_join(worker->thread[i], NULL);
+    }
+}
+
+// ================================================================ //
+// Hilos de gestión del servidor.
+// ================================================================ //
+/*
+    @brief Esta función es el hilo principal del servidor, gestiona las conexiones con los clientes y su distribución en los hilos de gestión de clientes.
+
+    @param void * arg: Referencia a la estructura general del servidor, es decir, un server_pt.
+
+    @retval NULL.
+*/
+static void * __server_main_worker(void * arg){
+    // Comprobación de argumento válido:
+    if (!arg) return NULL;
+
+    // Estructuras principales del servidor:
+    server_pt server = (server_pt)arg;
+    struct server_logger * logger = &server->logger;
+    struct server_conn * conn = &server->conn;
+    struct server_worker * worker = &server->worker;
+
+    // Bucle principal:
+    while (server->state == SERVER_STATE_RUNNING){
+        struct server_client_conn client;
+        socklen_t client_len = sizeof(client);
+
+        // Se acepta la conexión en la capa TCP:
+        client.fd = accept(conn->fd, (struct sockaddr *)&client, &client_len);
+        if (client.fd < 0){
+            if ((errno == EAGAIN) || (errno == EWOULDBLOCK)) usleep(10000);
+            continue;
+        }
+
+        // Se establece el socket del cliente como no bloqueante:
+        if (fcntl(client.fd, F_SETFL, O_NONBLOCK) < 0){
+            close(client.fd);
+            continue;
+        }
+
+        // Capa TLS para el cliente:
+        client.ssl = SSL_new(conn->ssl_ctx);
+        if(!client.ssl){
+            close(client.fd);
+            continue;
+        }
+
+        SSL_set_fd(client.ssl, client.fd);
+        if (SSL_accept(client.ssl) <= 0){
+            SSL_free(client.ssl);
+            close(client.fd);
+            continue;
+        }
+
+        // TODO...
+    }
+
+    return NULL;
+}
+
+/*
+    TODO:
+*/
+static void * __server_cli_worker(void * arg){
+    return NULL;
+}
 /* -------------------------------------------------------------------------------------------------------------------------------- */
 /* -------------------------------------------------------------------------------------------------------------------------------- */

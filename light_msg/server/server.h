@@ -43,31 +43,33 @@
 
 /* ---------------------------------------------------------------- */
 /* ---- Definiciones/Macros --------------------------------------- */
-#define DEFAULT_LOG_PATH                "./logs"
-#define DEFAULT_LOG_FILE                "server"
-#define DEFAULT_LOG_FILE_SIZE           10000
-#define DEFAULT_LOG_MIN_LVL             0
-#define MAX_LOG_ROUTE_LEN               255
-#define LOG_RESERVED_FORMAT_LEN         128
-#define MAX_LOG_MSG_LEN                 512
-#define LOG_LEVEL2STR(l)                (l == 0) ? "[DEBUG]"    : \
-                                        (l == 1) ? "[INFO]"     : \
-                                        (l == 2) ? "[WARNING]"  : \
-                                        "[ERROR]"
+#define DEFAULT_LOG_PATH                    "./logs"
+#define DEFAULT_LOG_FILE                    "server"
+#define DEFAULT_LOG_FILE_SIZE               10000
+#define DEFAULT_LOG_MIN_LVL                 0
+#define MAX_LOG_ROUTE_LEN                   255
+#define LOG_RESERVED_FORMAT_LEN             128
+#define MAX_LOG_MSG_LEN                     512
+#define LOG_LEVEL2STR(l)                    (l == 0) ? "[DEBUG]"    : \
+                                            (l == 1) ? "[INFO]"     : \
+                                            (l == 2) ? "[WARNING]"  : \
+                                            "[ERROR]"
+
+#define DEFAULT_CONN_CERT_PATH              "./certs/cert.pem"
+#define DEFAULT_CONN_KEY_PATH               "./certs/key.pem"
+#define DEFAULT_CONN_PORT                   4433
+#define MIN_CONN_PORT_NUMBER                1000
+
+#define DEFAULT_NUM_WORKERS                 8
+#define DEFAULT_CLIENT_READ_BUFFER_SIZE     8192
+#define DEFAULT_CLIENT_WRITE_BUFFER_SIZE    8192
+#define DEFAULT_CLIENT_TIMEOUT              1200
+#define DEFAULT_CLIENT_CAPACITY_BLOCK       10
+
+#define MAX_EPOLL_EVENTS                    64
+#define MAX_WORKER_CLIENT_NUM               65536
 
 
-#define DEFAULT_CERT_PATH               "./certs/cert.pem"
-#define DEFAULT_KEY_PATH                "./certs/key.pem"
-
-
-#define DEFAULT_SERVER_PORT             4433
-#define DEFAULT_NUM_WORKERS             8
-
-#define MAX_EPOLL_EVENTS                64
-#define MAX_SOCKET_FD                   65536
-
-#define DEFAULT_CLIENT_READ_BUFFER_SIZE 8192
-#define DEFAULT_CLIENT_WRITE_BUFFER_SIZE 8192
 /* ---------------------------------------------------------------- */
 /* ---------------------------------------------------------------- */
 
@@ -171,6 +173,16 @@ struct server_conn{
     char * key_path; 
 };
 
+// Estructura de configuración de la estructura de conexión del servidor:
+struct server_conn_conf{
+    // Datos de conexión:
+    int port;
+
+    // Rutas a certificado y clave del servidor:
+    char * cert_path;
+    char * key_path;
+};
+
 // Estructura con los datos del cliente conectado:
 struct server_client_conn{
     // Datos de conexión del cliente conectado:
@@ -194,14 +206,19 @@ struct server_client_conn{
 
     // Timeout:
     time_t last_action_time;
-    time_t timeout;
 
     // Flag de datos pendientes:
     bool data_pending;
 };
 
+// Estructura con el contexto de trabajo para el hilo de gestión de clientes.
+struct server_client_ctx{
+    struct server_worker * server_worker;
+    size_t client_index;
+};
+
 // Estructura con los datos de los hilos:
-struct server_workers{
+struct server_worker{
     // Número de hilos:
     int num_workers;
 
@@ -212,18 +229,36 @@ struct server_workers{
 
     // Referencia a los clientes conectados por hilo:
     struct server_client_conn ** client;
+    struct server_client_ctx * client_ctx;
     size_t * client_count;
     size_t * client_capacity;
+    size_t client_capacity_block;
+
+    // Tamaño de buffers y timeout:
     size_t client_read_buffer_size;
     size_t client_write_buffer_size;
+    time_t client_timeout;
+};
 
+// Estructura con los datos de configuración de los hilos:
+struct server_worker_conf{
+    // Configuración de número de hilos:
+    int num_workers;
+
+    // Configuración del bloque de capacidad mínimo de clientes por hilo:
+    size_t client_capacity_block;
+
+    // Configuración de tamaño de buffers y timeout:
+    size_t client_read_buffer_size;
+    size_t client_write_buffer_size;
+    time_t client_timeout;
 };
 
 // Estructura global del servidor:
 struct server{
     struct server_logger logger;
     struct server_conn conn;
-    struct server_workers workers;
+    struct server_worker worker;
 
     enum server_state state;
 };
@@ -246,7 +281,6 @@ typedef struct server_conf * server_conf_pt;
 
 /* ---------------------------------------------------------------- */
 /* ---- Prototipo de las funciones -------------------------------- */
-server_pt server_init(server_conf_pt conf);
 /* ---------------------------------------------------------------- */
 /* ---------------------------------------------------------------- */
 
