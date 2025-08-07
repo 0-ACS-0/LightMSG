@@ -95,7 +95,7 @@ enum server_logger_level{
 
 // Estado del cliente:
 enum server_client_state{
-    CLIENT_STATE_HANDSHAKE,
+    CLIENT_STATE_STANDBY,
     CLIENT_STATE_ESTABLISH,
     CLIENT_STATE_CLOSING,
     CLIENT_STATE_CLOSED
@@ -206,9 +206,6 @@ struct server_client_conn{
 
     // Timeout:
     time_t last_action_time;
-
-    // Flag de datos pendientes:
-    bool data_pending;
 };
 
 // Estructura con el contexto de trabajo para el hilo de gestión de clientes.

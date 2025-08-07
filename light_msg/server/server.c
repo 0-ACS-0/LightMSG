@@ -1,4 +1,6 @@
 #include "server.h"
+#include <stdlib.h>
+#include <sys/epoll.h>
 
 
 
@@ -602,19 +604,39 @@ static void * __server_main_worker(void * arg){
 
     // Bucle principal:
     while (server->state == SERVER_STATE_RUNNING){
+        // Se crea temporalmente en esta iteración, la estructura de conexión de un cliente completo:
         struct server_client_conn client;
         socklen_t client_len = sizeof(client);
+
+        client.read_buffer = calloc(worker->client_read_buffer_size, sizeof(char));
+        if (!client.read_buffer) continue;
+        client.write_buffer = calloc(worker->client_write_buffer_size, sizeof(char));
+        if (!client.write_buffer){
+            free(client.read_buffer);
+            continue;
+        }
+
+        client.read_len = 0;
+        client.read_off = 0;
+        client.write_len = 0;
+        client.write_off = 0;
+        client.last_action_time = time(NULL);
+        client.state = CLIENT_STATE_STANDBY;
 
         // Se acepta la conexión en la capa TCP:
         client.fd = accept(conn->fd, (struct sockaddr *)&client, &client_len);
         if (client.fd < 0){
             if ((errno == EAGAIN) || (errno == EWOULDBLOCK)) usleep(10000);
+            free(client.read_buffer);
+            free(client.write_buffer);
             continue;
         }
 
         // Se establece el socket del cliente como no bloqueante:
         if (fcntl(client.fd, F_SETFL, O_NONBLOCK) < 0){
             close(client.fd);
+            free(client.read_buffer);
+            free(client.write_buffer);
             continue;
         }
 
@@ -622,6 +644,8 @@ static void * __server_main_worker(void * arg){
         client.ssl = SSL_new(conn->ssl_ctx);
         if(!client.ssl){
             close(client.fd);
+            free(client.read_buffer);
+            free(client.write_buffer);
             continue;
         }
 
@@ -629,10 +653,54 @@ static void * __server_main_worker(void * arg){
         if (SSL_accept(client.ssl) <= 0){
             SSL_free(client.ssl);
             close(client.fd);
+            free(client.read_buffer);
+            free(client.write_buffer);
             continue;
         }
 
-        // TODO...
+        // Distribución de la carga del cliente a los hilos de gestión de cliente:
+        size_t th_index = 0;
+        for (size_t i = 0; i < worker->num_workers - 1; i++){
+            // Se encuentra el hilo con menor carga de clientes:
+            if (worker->client_count[i+1] > worker->client_count[th_index]) th_index = i;
+        }
+
+        if (worker->client_count[th_index] == worker->client_capacity[th_index]){
+            // Se comprueba que haya suficiente capacidad, y se incrementa en caso contrario:
+            void * temp = realloc(worker->client[th_index], sizeof(struct server_client_conn) * (worker->client_capacity[th_index] + worker->client_capacity_block));
+            if (!temp){
+                SSL_free(client.ssl);
+                close(client.fd);
+                free(client.read_buffer);
+                free(client.write_buffer);
+                continue;
+            }
+            worker->client[th_index] = temp;
+            worker->client_capacity[th_index] += worker->client_capacity_block;
+        }
+
+        size_t pos_index = 0;
+        for (size_t i = 0; i < worker->client_capacity[th_index]; i++){
+            // En el hilo seleccionado, se copia el cliente en el primer slot libre de clientes del hilo:
+            if (worker->client[th_index][i].state != CLIENT_STATE_STANDBY) continue;
+            pos_index = i;
+            worker->client[th_index][i] = client;
+            worker->client[th_index][i].state = CLIENT_STATE_ESTABLISH;
+            worker->client_count[th_index]++;
+            break;
+        }
+
+        struct epoll_event event;
+        event.events = EPOLLIN;
+        event.data.ptr = &worker->client[th_index][pos_index];
+        if(epoll_ctl(worker->epoll_fd[th_index], EPOLL_CTL_ADD, client.fd, &event) == -1){
+            // Se añade el tipo de eventos a escuchar y el descriptor socket al epoll del hilo. (La estructura event es copiada internamente en la función ctl).
+            SSL_free(client.ssl);
+            close(client.fd);
+            free(client.read_buffer);
+            free(client.write_buffer);
+            continue;
+        }
     }
 
     return NULL;
@@ -642,6 +710,8 @@ static void * __server_main_worker(void * arg){
     TODO:
 */
 static void * __server_cli_worker(void * arg){
+    // Comprobación de argumento válido:
+    if (!arg) return NULL;
     return NULL;
 }
 /* -------------------------------------------------------------------------------------------------------------------------------- */
