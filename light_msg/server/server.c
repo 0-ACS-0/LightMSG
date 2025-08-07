@@ -1,7 +1,4 @@
 #include "server.h"
-#include <stdlib.h>
-#include <sys/epoll.h>
-
 
 
 /* -------------------------------------------------------------------------------------------------------------------------------- */
@@ -18,7 +15,7 @@ static bool _server_conn_init(struct server_conn * conn);
 static void _server_conn_deinit(struct server_conn * conn);
 
 // ==== Worker ==== //
-static bool _server_worker_conf(struct server_worker * workers, struct server_worker_conf * workers_conf);
+static bool _server_worker_conf(struct server_worker * workers, struct server_worker_conf * workers_conf, enum server_state * server_state);
 static void _server_worker_deinit(struct server_worker * worker);
 static bool _server_worker_launch(struct server_worker * worker);
 static void _server_worker_wait_land(struct server_worker * worker);
@@ -26,6 +23,7 @@ static void _server_worker_wait_land(struct server_worker * worker);
 // ==== Hilos ==== //
 static void * __server_main_worker(void * arg);
 static void * __server_cli_worker(void * arg);
+static void _server_cli_close(struct server_client_conn * client_conn, int epoll_fd, size_t * count);
 /* -------------------------------------------------------------------------------------------------------------------------------- */
 /* -------------------------------------------------------------------------------------------------------------------------------- */
 
@@ -416,7 +414,7 @@ static void * __server_cli_worker(void * arg);
     @retval true: Error en la inicialización de workers del servidor.
     @retval false: No han ocurrido errores.
 */
-static bool _server_worker_conf(struct server_worker * worker, struct server_worker_conf * worker_conf){
+static bool _server_worker_conf(struct server_worker * worker, struct server_worker_conf * worker_conf, enum server_state * server_state){
     // Comprobación de estructuras válidas:
     if (worker == NULL) return true;
     if (worker_conf == NULL) return true;
@@ -458,6 +456,7 @@ static bool _server_worker_conf(struct server_worker * worker, struct server_wor
         worker->client_capacity[i] = worker->client_capacity_block;
         worker->client_ctx[i].server_worker = worker;
         worker->client_ctx[i].client_index = i;
+        worker->client_ctx[i].server_state = server_state;
         if (worker->client[i]) continue;
         _server_worker_deinit(worker);
         return true;
@@ -624,7 +623,7 @@ static void * __server_main_worker(void * arg){
         client.state = CLIENT_STATE_STANDBY;
 
         // Se acepta la conexión en la capa TCP:
-        client.fd = accept(conn->fd, (struct sockaddr *)&client, &client_len);
+        client.fd = accept(conn->fd, (struct sockaddr *)&client.addr, &client_len);
         if (client.fd < 0){
             if ((errno == EAGAIN) || (errno == EWOULDBLOCK)) usleep(10000);
             free(client.read_buffer);
@@ -662,13 +661,24 @@ static void * __server_main_worker(void * arg){
         size_t th_index = 0;
         for (size_t i = 0; i < worker->num_workers - 1; i++){
             // Se encuentra el hilo con menor carga de clientes:
-            if (worker->client_count[i+1] > worker->client_count[th_index]) th_index = i;
+            if (worker->client_count[i+1] < worker->client_count[th_index]) th_index = i;
         }
 
         if (worker->client_count[th_index] == worker->client_capacity[th_index]){
+            // Se comprueba que el número de clientes no excede el máximo permitido:
+            if ((worker->client_capacity[th_index] + worker->client_capacity_block) >= MAX_WORKER_CLIENT_NUM){
+                SSL_shutdown(client.ssl);
+                SSL_free(client.ssl);
+                close(client.fd);
+                free(client.read_buffer);
+                free(client.write_buffer);
+                continue;
+            }
+
             // Se comprueba que haya suficiente capacidad, y se incrementa en caso contrario:
             void * temp = realloc(worker->client[th_index], sizeof(struct server_client_conn) * (worker->client_capacity[th_index] + worker->client_capacity_block));
             if (!temp){
+                SSL_shutdown(client.ssl);
                 SSL_free(client.ssl);
                 close(client.fd);
                 free(client.read_buffer);
@@ -695,11 +705,13 @@ static void * __server_main_worker(void * arg){
         event.data.ptr = &worker->client[th_index][pos_index];
         if(epoll_ctl(worker->epoll_fd[th_index], EPOLL_CTL_ADD, client.fd, &event) == -1){
             // Se añade el tipo de eventos a escuchar y el descriptor socket al epoll del hilo. (La estructura event es copiada internamente en la función ctl).
+            SSL_shutdown(client.ssl);
             SSL_free(client.ssl);
             close(client.fd);
             free(client.read_buffer);
             free(client.write_buffer);
-            continue;
+            worker->client[th_index][pos_index].state = CLIENT_STATE_STANDBY;
+            worker->client_count[th_index]--; 
         }
     }
 
@@ -707,12 +719,136 @@ static void * __server_main_worker(void * arg){
 }
 
 /*
-    TODO:
+    @brief Esta función rerpresenta un hilo gestor de clientes del servidor, encargado de gestionar los eventos de estos (lectura y escritura).
+
+    @param void * arg: Referencia a la estructura server_client_ctx del hilo.
+
+    @retval NULL.
 */
 static void * __server_cli_worker(void * arg){
     // Comprobación de argumento válido:
     if (!arg) return NULL;
+
+    // Estructura del contexto del cliente asignado al hilo:
+    struct server_client_ctx * client_ctx = (struct server_client_ctx *)arg;
+    struct server_worker * worker = client_ctx->server_worker;
+    struct server_client_conn * clients = worker->client[client_ctx->client_index];
+
+    int epoll_fd = worker->epoll_fd[client_ctx->client_index];
+    struct epoll_event events[MAX_EPOLL_EVENTS];
+
+    while (*client_ctx->server_state == SERVER_STATE_RUNNING){
+        // Escucha de eventos en los sockets clientes asignados al hilo:
+        int nfds = epoll_wait(epoll_fd, events, MAX_EPOLL_EVENTS, 1000);
+        if ((nfds < 0) && (errno == EINTR)) continue;
+
+        // Verificación de los timeouts de los clientes tras un evento:
+        time_t current_time = time(NULL);
+        for (size_t i = 0; i < worker->client_capacity[client_ctx->client_index]; i++){
+            struct server_client_conn * temp_client = &clients[i];
+            if (temp_client->state != CLIENT_STATE_ESTABLISH) continue;
+            if (difftime(current_time, temp_client->last_action_time) <= worker->client_timeout) continue;
+            _server_cli_close(temp_client, epoll_fd, &worker->client_count[client_ctx->client_index]);
+        }
+
+        // Gestión de los eventos capturados en los sockets para lectura de datos:
+        for (size_t i = 0; i < nfds; i++){
+            struct server_client_conn * client = (struct server_client_conn *)events[i].data.ptr;
+            if (!client || (client->state != CLIENT_STATE_ESTABLISH)) continue;
+
+            // Lectura de datos del cliente:
+            if (!(events[i].events & EPOLLIN)) continue;
+            int rb = SSL_read(client->ssl, client->read_buffer + client->read_off, worker->client_read_buffer_size - client->read_off);
+            if (rb > 0){
+                // Caso recepción de datos:
+                client->read_len += rb;
+                client->last_action_time = current_time;
+
+                // TODO: Función para procesar los datos leídos del cliente. (Idea: Puntero a función en server_client_ctx)
+            } else if ((rb == 0) || (SSL_get_error(client->ssl, rb) == SSL_ERROR_ZERO_RETURN)){
+                // Caso cierre de conexión por parte del cliente:
+                _server_cli_close(client, epoll_fd, &worker->client_count[client_ctx->client_index]);
+            } else {
+                // Caso error en la comunicación con el cliente:
+                int ssl_err = SSL_get_error(client->ssl, rb);
+                if ((ssl_err != SSL_ERROR_WANT_READ) && (ssl_err != SSL_ERROR_WANT_WRITE)){
+                    _server_cli_close(client, epoll_fd, &worker->client_count[client_ctx->client_index]);
+                }
+            }
+        }
+
+        // Gestión de los eventos capturados en el socket para escritura de datos:
+        for (size_t i = 0; i < nfds; i++){
+            // Escucha de eventos en los sockets clientes asignados al hilo:
+            struct server_client_conn * client = (struct server_client_conn *)events[i].data.ptr;
+            if (!client || (client->state != CLIENT_STATE_ESTABLISH)) continue;
+
+            // Escritura de datos del cliente:
+            if ((client->write_len == 0) || !(events[i].events & EPOLLOUT)) continue;
+            int wb = SSL_write(client->ssl, client->write_buffer + client->write_off, client->write_len - client->write_off);
+
+            if (wb > 0){
+                // Caso escritura de datos:
+                client->write_off += wb;
+                if (client->write_off == client->write_len){
+                    // Caso toda la respuesta enviada:
+                    client->write_off = 0;
+                    client->write_len = 0;
+
+                    struct epoll_event ev = {.events = EPOLLIN, .data.ptr = client};        // Desactivación de evento de escritura libre cuando finaliza el mensaje.
+                    epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client->fd, &ev);
+                }
+                client->last_action_time = current_time;
+            } else {
+                // Caso error en la comunicación con el cliente:
+                int ssl_err = SSL_get_error(client->ssl, wb);
+                if ((ssl_err != SSL_ERROR_WANT_READ) && (ssl_err != SSL_ERROR_WANT_WRITE)){
+                    _server_cli_close(client, epoll_fd, &worker->client_count[client_ctx->client_index]);
+                }
+            }
+        }
+    }
+
+    // Cierre completo de los clientes conectados al hilo:
+    for (size_t i = 0; i < worker->client_capacity[client_ctx->client_index]; i++){
+        _server_cli_close(&clients[i], epoll_fd, &worker->client_count[client_ctx->client_index]);
+    }
+
     return NULL;
+}
+
+/*
+    @brief Función para cerrar correctamente la conexión de un cliente conectado.
+    @note Libera los recursos en memoria reservados para el cliente pero no la estructura en sí.
+
+    @param struct server_client_conn * client_conn: Referencia a la estructura de conexión del cliente.
+    @param int epoll_fd: Descriptor de archivo de la estructura epoll del hilo que maneja el cliente a cerrar.
+    @param size_t * count: Referencia al contador de clientes conectados por hilo al que pertenece el cliente.
+
+    @retval None.
+*/
+static void _server_cli_close(struct server_client_conn * client_conn, int epoll_fd, size_t * count){
+    // Se compruba que los parámetros sean válidos:
+    if (!client_conn || !count) return;
+    if (client_conn->state != CLIENT_STATE_ESTABLISH) return;
+
+    // Cierre completo y seguro del cliente:
+    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_conn->fd, NULL);
+
+    if (client_conn->ssl){
+        SSL_shutdown(client_conn->ssl);
+        SSL_free(client_conn->ssl);
+    }
+
+    close(client_conn->fd);
+
+    free(client_conn->read_buffer);
+    client_conn->read_buffer = NULL;
+    free(client_conn->write_buffer);
+    client_conn->write_buffer = NULL;
+
+    client_conn->state = CLIENT_STATE_STANDBY;
+    (*count)--;
 }
 /* -------------------------------------------------------------------------------------------------------------------------------- */
 /* -------------------------------------------------------------------------------------------------------------------------------- */

@@ -67,7 +67,7 @@
 #define DEFAULT_CLIENT_CAPACITY_BLOCK       10
 
 #define MAX_EPOLL_EVENTS                    64
-#define MAX_WORKER_CLIENT_NUM               65536
+#define MAX_WORKER_CLIENT_NUM               65536/8
 
 
 /* ---------------------------------------------------------------- */
@@ -212,6 +212,7 @@ struct server_client_conn{
 struct server_client_ctx{
     struct server_worker * server_worker;
     size_t client_index;
+    enum server_state * server_state;
 };
 
 // Estructura con los datos de los hilos:
