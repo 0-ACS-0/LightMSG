@@ -17,7 +17,7 @@ static void _server_conn_deinit(struct server_conn * conn);
 // ==== Worker ==== //
 static bool _server_worker_conf(struct server_worker * worker, struct server_worker_conf * worker_conf, enum server_state * server_state);
 static void _server_worker_deinit(struct server_worker * worker);
-static bool _server_worker_launch(struct server_worker * worker);
+static bool _server_worker_launch(server_pt server);
 static void _server_worker_wait_land(struct server_worker * worker);
 /* -------------------------------------------------------------------------------------------------------------------------------- */
 /* -------------------------------------------------------------------------------------------------------------------------------- */
@@ -47,7 +47,7 @@ server_pt server_init(server_conf_pt server_conf){
     // Inicialización y configuración del logger del servidor:
     err |= _server_logger_init(&server->logger);
     _server_logger_conf(&server->logger, &server_conf->logger_conf);
-    
+
     // Inicialización y configuración de datos de conexión del servidor:
     _server_conn_conf(&server->conn, &server_conf->conn_conf);
     err |= _server_conn_init(&server->conn);
@@ -83,7 +83,7 @@ bool server_open(server_pt server){
 
     // Lanzamiento de hilos de recepción y gestión de clientes:
     server->state = SERVER_STATE_RUNNING;
-    if(_server_worker_launch(&server->worker)){
+    if(_server_worker_launch(server)){
         server->state = SERVER_STATE_INITIALIZED;
         return true;
     }
@@ -235,17 +235,28 @@ static void _server_logger_conf(struct server_logger * logger, struct server_log
     if (!logger) return;
     if (!logger_conf) return;
 
+    // Estado válido para configuración:
+    if (logger->state == LOGGER_ERR) return;
+
+    // Lock para evitar problemas:
+    pthread_mutex_lock(&logger->log_lock);
+
     // Configuración de miembros configurables:
     if (logger_conf->log_path){
         if (logger->log_path) free(logger->log_path);
+        logger->log_path = NULL;
         logger->log_path = strdup(logger_conf->log_path);
     }
     if (logger_conf->log_file){
         if (logger->log_file) free(logger->log_file);
+        logger->log_file = NULL;
         logger->log_file = strdup(logger_conf->log_file);
     } 
     if (logger_conf->log_max_size) logger->log_max_size = logger_conf->log_max_size;
     logger->log_min_lvl = logger_conf->log_min_lvl;
+
+    // Liberación del lock:
+    pthread_mutex_unlock(&logger->log_lock);
 }
 
 
@@ -285,7 +296,7 @@ static void _server_log(struct server_logger * logger, enum server_logger_level 
     strftime(timestr, sizeof(timestr), "%Y-%m-%d %H:%M:%S", localtime(&actual_time));
 
     char fullmsg[MAX_LOG_MSG_LEN];
-    snprintf(fullmsg, sizeof(fullmsg), "[%s][%s]: %s", timestr, LOG_LEVEL2STR(log_level), log_msg);
+    snprintf(fullmsg, sizeof(fullmsg), "[%s]%s: %s", timestr, LOG_LEVEL2STR(log_level), log_msg);
 
     // Caso de primera escritura del servidor al log:
     if (!logger->log_fd){
@@ -649,9 +660,11 @@ static void _server_worker_deinit(struct server_worker * worker){
     @retval true: Error en la inicialización de workers del servidor.
     @retval false: No han ocurrido errores.
 */
-static bool _server_worker_launch(struct server_worker * worker){
+static bool _server_worker_launch(server_pt server){
     // Comprobación de worker válido:
-    if (!worker) return true;
+    if (!server) return true;
+
+    struct server_worker * worker = &server->worker;
 
     // Lanzamiento de los hilos que gestionan los clientes:
     for (size_t i = 0; i < worker->num_workers; i++){
@@ -659,14 +672,16 @@ static bool _server_worker_launch(struct server_worker * worker){
         if(pthread_create(&worker->thread[i], NULL, __server_cli_worker, (void *)&worker->client_ctx[i]) == 0) continue;
         for (ssize_t j = (ssize_t)i-1; j >= 0; j--){
             pthread_cancel(worker->thread[j]);
+            pthread_join(worker->thread[j],NULL);
         }
         return true;
     }
 
     // Lanzamiento del hilo que gestiona las conexiones:
-    if(pthread_create(&worker->main_thread, NULL, __server_main_worker, (void *)worker) != 0){
+    if(pthread_create(&worker->main_thread, NULL, __server_main_worker, (void *)server) != 0){
         for (size_t i = 0; i < worker->num_workers; i++){
             pthread_cancel(worker->thread[i]);
+            pthread_join(worker->thread[i], NULL);
         }
         return true;
     }
