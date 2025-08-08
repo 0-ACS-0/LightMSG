@@ -15,15 +15,10 @@ static bool _server_conn_init(struct server_conn * conn);
 static void _server_conn_deinit(struct server_conn * conn);
 
 // ==== Worker ==== //
-static bool _server_worker_conf(struct server_worker * workers, struct server_worker_conf * workers_conf, enum server_state * server_state);
+static bool _server_worker_conf(struct server_worker * worker, struct server_worker_conf * worker_conf, enum server_state * server_state);
 static void _server_worker_deinit(struct server_worker * worker);
 static bool _server_worker_launch(struct server_worker * worker);
 static void _server_worker_wait_land(struct server_worker * worker);
-
-// ==== Hilos ==== //
-static void * __server_main_worker(void * arg);
-static void * __server_cli_worker(void * arg);
-static void _server_cli_close(struct server_client_conn * client_conn, int epoll_fd, size_t * count);
 /* -------------------------------------------------------------------------------------------------------------------------------- */
 /* -------------------------------------------------------------------------------------------------------------------------------- */
 
@@ -32,6 +27,121 @@ static void _server_cli_close(struct server_client_conn * client_conn, int epoll
 
 /* -------------------------------------------------------------------------------------------------------------------------------- */
 /* ---- Implementación de funciones públicas -------------------------------------------------------------------------------------- */
+/*
+    @brief Función para inicializar el servidor.
+
+    @param server_conf_pt server_conf: Estructura con toda la configuración del servidor.
+
+    @retval server_pt: Referencia al servidor.
+*/
+server_pt server_init(server_conf_pt server_conf){
+    // Validación de estructura de configuración válida:
+    if (!server_conf) return NULL;
+
+    // Reserva de memoria para la estructura global del servidor:
+    server_pt server = (server_pt)malloc(sizeof(server_t));
+    if (!server) return NULL;
+
+    bool err = false;
+
+    // Inicialización y configuración del logger del servidor:
+    err |= _server_logger_init(&server->logger);
+    _server_logger_conf(&server->logger, &server_conf->logger_conf);
+    
+    // Inicialización y configuración de datos de conexión del servidor:
+    _server_conn_conf(&server->conn, &server_conf->conn_conf);
+    err |= _server_conn_init(&server->conn);
+
+    // Inicialización y configuración del worker del servidor:
+    err |= _server_worker_conf(&server->worker, &server_conf->worker_conf, &server->state);
+
+    // Comprobación de errores de inicialización internos:
+    if (err){
+        _server_logger_deinit(&server->logger);
+        _server_conn_deinit(&server->conn);
+        free(server);
+        return NULL;
+    }
+
+    // Estado de servidor inicializado:
+    server->state = SERVER_STATE_INITIALIZED;
+    return server;
+}
+
+/*
+    @brief Función para comenzar los hilos de gestión del servidor, aceptando conexiones.
+
+    @param server_pt server: Referencia al servidor (debe estar previamente inicializado).
+
+    @retval true: Ha ocurrido un error.
+    @retval false: No han ocurrido errores.
+*/
+bool server_open(server_pt server){
+    // Comprobación de servidor válido:
+    if (!server) return true;
+    if ((server->state != SERVER_STATE_INITIALIZED) && (server->state != SERVER_STATE_STOPPED)) return true;
+
+    // Lanzamiento de hilos de recepción y gestión de clientes:
+    server->state = SERVER_STATE_RUNNING;
+    if(_server_worker_launch(&server->worker)){
+        server->state = SERVER_STATE_INITIALIZED;
+        return true;
+    }
+
+    return false;
+}
+
+/*
+    @brief Función para finalizar los hilos de gestión del servidor, cerrando conexiones.
+
+    @param server_pt server: Referencia al servidor (debe estar previamente inicializado).
+
+    @retval true: Ha ocurrido un error.
+    @retval false: No han ocurrido errores.
+*/
+bool server_close(server_pt server){
+    // Comprobación de servidor válido:
+    if (!server) return true;
+    if (server->state != SERVER_STATE_RUNNING) return true;
+
+    // Detención de los hilos:
+    server->state = SERVER_STATE_STOPPING;
+    _server_worker_wait_land(&server->worker);
+    server->state = SERVER_STATE_STOPPED;
+
+    return false;
+}
+
+/*
+    @brief Función para liberar la memoria del servidor por completo.
+    @note El servidor debe estar completamente detenido para liberar la memoria, evitando así fugas
+    en hilos que no hayan terminado su ejecución.
+
+    @param server_pt server: Referencia al servidor.
+
+    @retval true: Ha ocurrido un error.
+    @retval false: No han ocurrido errores.
+*/
+bool server_deinit(server_pt * server){
+    // Comprobación de servidor válido:
+    if ((!server) || (!(*server))) return true;
+    if (((*server)->state != SERVER_STATE_STOPPED) && ((*server)->state != SERVER_STATE_INITIALIZED)) return true;
+
+    // Desinicialización del worker:
+    _server_worker_deinit(&(*server)->worker);
+
+    // Desinicialización de datos de conexión del servidor:
+    _server_conn_deinit(&(*server)->conn);
+
+    // Desinicialización del logger del servidor:
+    _server_logger_deinit(&(*server)->logger);
+
+    // Liberación de memoria del servidor:
+    free(*server);
+    *server = NULL;
+
+    return false;
+}
 /* -------------------------------------------------------------------------------------------------------------------------------- */
 /* -------------------------------------------------------------------------------------------------------------------------------- */
 
@@ -419,8 +529,13 @@ static bool _server_worker_conf(struct server_worker * worker, struct server_wor
     if (worker == NULL) return true;
     if (worker_conf == NULL) return true;
 
-    // Se desinicializa la estrucutra de workers (assegura punteros a NULL antes de inicializar):
-    _server_worker_deinit(worker);
+    // Se aseguran que los punteros sean inválidos:
+    worker->client_ctx = NULL;
+    worker->client_capacity = NULL;
+    worker->client_count = NULL;
+    worker->client = NULL;
+    worker->epoll_fd = NULL;
+    worker->thread = NULL;
 
     // Asignación de valores configurados (o por defecto si no se dan - miembros estáticos):
     worker->num_workers = (worker_conf->num_workers > 0) ? worker_conf->num_workers : DEFAULT_NUM_WORKERS;
@@ -510,7 +625,7 @@ static void _server_worker_deinit(struct server_worker * worker){
         }
 
         if (worker->client[i]) free(worker->client[i]);
-        if (worker->client[i]) worker->client[i] = NULL;
+        worker->client[i] = NULL;
     }
     if (worker->client_ctx) free(worker->client_ctx);
     worker->client_ctx = NULL;
@@ -579,11 +694,15 @@ static void _server_worker_wait_land(struct server_worker * worker){
     for (size_t i = 0; i < worker->num_workers; i++){
         pthread_join(worker->thread[i], NULL);
     }
+
+    pthread_join(worker->main_thread, NULL);
 }
 
 // ================================================================ //
 // Hilos de gestión del servidor.
 // ================================================================ //
+static void ___server_cli_close(struct server_client_conn * client_conn, int epoll_fd, size_t * count);
+
 /*
     @brief Esta función es el hilo principal del servidor, gestiona las conexiones con los clientes y su distribución en los hilos de gestión de clientes.
 
@@ -748,7 +867,7 @@ static void * __server_cli_worker(void * arg){
             struct server_client_conn * temp_client = &clients[i];
             if (temp_client->state != CLIENT_STATE_ESTABLISH) continue;
             if (difftime(current_time, temp_client->last_action_time) <= worker->client_timeout) continue;
-            _server_cli_close(temp_client, epoll_fd, &worker->client_count[client_ctx->client_index]);
+            ___server_cli_close(temp_client, epoll_fd, &worker->client_count[client_ctx->client_index]);
         }
 
         // Gestión de los eventos capturados en los sockets para lectura de datos:
@@ -767,12 +886,12 @@ static void * __server_cli_worker(void * arg){
                 // TODO: Función para procesar los datos leídos del cliente. (Idea: Puntero a función en server_client_ctx)
             } else if ((rb == 0) || (SSL_get_error(client->ssl, rb) == SSL_ERROR_ZERO_RETURN)){
                 // Caso cierre de conexión por parte del cliente:
-                _server_cli_close(client, epoll_fd, &worker->client_count[client_ctx->client_index]);
+                ___server_cli_close(client, epoll_fd, &worker->client_count[client_ctx->client_index]);
             } else {
                 // Caso error en la comunicación con el cliente:
                 int ssl_err = SSL_get_error(client->ssl, rb);
                 if ((ssl_err != SSL_ERROR_WANT_READ) && (ssl_err != SSL_ERROR_WANT_WRITE)){
-                    _server_cli_close(client, epoll_fd, &worker->client_count[client_ctx->client_index]);
+                    ___server_cli_close(client, epoll_fd, &worker->client_count[client_ctx->client_index]);
                 }
             }
         }
@@ -803,7 +922,7 @@ static void * __server_cli_worker(void * arg){
                 // Caso error en la comunicación con el cliente:
                 int ssl_err = SSL_get_error(client->ssl, wb);
                 if ((ssl_err != SSL_ERROR_WANT_READ) && (ssl_err != SSL_ERROR_WANT_WRITE)){
-                    _server_cli_close(client, epoll_fd, &worker->client_count[client_ctx->client_index]);
+                    ___server_cli_close(client, epoll_fd, &worker->client_count[client_ctx->client_index]);
                 }
             }
         }
@@ -811,7 +930,7 @@ static void * __server_cli_worker(void * arg){
 
     // Cierre completo de los clientes conectados al hilo:
     for (size_t i = 0; i < worker->client_capacity[client_ctx->client_index]; i++){
-        _server_cli_close(&clients[i], epoll_fd, &worker->client_count[client_ctx->client_index]);
+        ___server_cli_close(&clients[i], epoll_fd, &worker->client_count[client_ctx->client_index]);
     }
 
     return NULL;
@@ -827,7 +946,7 @@ static void * __server_cli_worker(void * arg){
 
     @retval None.
 */
-static void _server_cli_close(struct server_client_conn * client_conn, int epoll_fd, size_t * count){
+static void ___server_cli_close(struct server_client_conn * client_conn, int epoll_fd, size_t * count){
     // Se compruba que los parámetros sean válidos:
     if (!client_conn || !count) return;
     if (client_conn->state != CLIENT_STATE_ESTABLISH) return;

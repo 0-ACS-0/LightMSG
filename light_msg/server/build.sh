@@ -1,1 +1,1 @@
-gcc server.c -o server -lpthread -lssl -lcrypto
+gcc -g -Wall server.c test_server.c -o test_server.elf -lpthread -lssl -lcrypto

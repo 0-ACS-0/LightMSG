@@ -260,6 +260,13 @@ struct server{
 
     enum server_state state;
 };
+
+// Estructura global de configuración del servidor:
+struct server_conf{
+    struct server_logger_conf logger_conf;
+    struct server_conn_conf conn_conf;
+    struct server_worker_conf worker_conf;
+};
 /* ---------------------------------------------------------------- */
 /* ---------------------------------------------------------------- */
 
@@ -270,7 +277,8 @@ struct server{
 /* ---- Tipos de datos -------------------------------------------- */
 typedef struct server server_t;
 typedef server_t * server_pt;
-typedef struct server_conf * server_conf_pt;
+typedef struct server_conf server_conf_t;
+typedef server_conf_t * server_conf_pt;
 /* ---------------------------------------------------------------- */
 /* ---------------------------------------------------------------- */
 
@@ -279,6 +287,10 @@ typedef struct server_conf * server_conf_pt;
 
 /* ---------------------------------------------------------------- */
 /* ---- Prototipo de las funciones -------------------------------- */
+server_pt server_init(server_conf_pt server_conf);
+bool server_open(server_pt server);
+bool server_close(server_pt server);
+bool server_deinit(server_pt * server);
 /* ---------------------------------------------------------------- */
 /* ---------------------------------------------------------------- */
 
