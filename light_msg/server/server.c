@@ -933,6 +933,7 @@ static void * __server_cli_worker(void * arg){
 
                     // Procesado de los datos leídos:
                     if(worker->on_client_rcv) worker->on_client_rcv(client);      // TODO: Desacoplar procesamiento del hilo (ahora, esta función es bloqueante)
+                    memset(client->read_buffer, 0, worker->client_read_buffer_size);
 
                     // Log de debug para registrar la lectura de datos del cliente:
                     _server_log(client_logger, LOG_DEBUG, "Lectura - Se han leído datos del cliente %s:%d", ip_str, port);

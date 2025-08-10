@@ -15,19 +15,12 @@ def tls_client():
         with context.wrap_socket(sock, server_hostname=HOST) as ssock:
             print(f"Conectado a {HOST}:{PORT} con TLS")
             
-            # Enviar el mensaje como bytes
+
+            # Bucle de envío de datos:
             ch = 'a'
-
-            try:
+            while ch != "exit":
+                ch = input("Texto a enviar ('exit' para salir): ")
                 ssock.sendall(ch.encode('utf-8'))
-            except Exception as e:
-                print(f"Error enviando datos: {e}")
-
-            # Condición para detener el cliente
-
-            while ch != 'q':
-                ch = input("q para cerrar cliente: ")
-            
             # Cierre limpio:
             try:
                 ssock.shutdown(socket.SHUT_RDWR)

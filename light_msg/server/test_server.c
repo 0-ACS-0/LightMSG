@@ -1,6 +1,12 @@
 #include "server.h"
 #include <stdio.h>
 
+void at_rcv(void * args){
+    struct server_client_conn * client = (struct server_client_conn *)args;
+    if (client->read_buffer[0] == ' ') return;
+    printf("%s\n", client->read_buffer);
+}
+
 int main(int argc, char ** argv){
 signal(SIGPIPE, SIG_IGN);
 
@@ -18,7 +24,8 @@ signal(SIGPIPE, SIG_IGN);
         .worker_conf.client_capacity_block = 2,
         .worker_conf.client_read_buffer_size = 2000,
         .worker_conf.client_write_buffer_size = 2000,
-        .worker_conf.client_timeout = 60
+        .worker_conf.client_timeout = 60,
+        .worker_conf.on_client_rcv = at_rcv
     });
 
     server_open(server);
