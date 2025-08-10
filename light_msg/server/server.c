@@ -1,8 +1,6 @@
 #include "server.h"
-#include <bits/pthreadtypes.h>
-#include <pthread.h>
-#include <stdlib.h>
-#include <unistd.h>
+#include <netinet/in.h>
+#include <string.h>
 
 
 /* -------------------------------------------------------------------------------------------------------------------------------- */
@@ -11,7 +9,7 @@
 static bool _server_logger_init(struct server_logger * logger);
 static void _server_logger_deinit(struct server_logger * logger);
 static void _server_logger_conf(struct server_logger * logger, struct server_logger_conf * logger_conf);
-static void _server_log(struct server_logger * logger, enum server_logger_level log_level, const char * log_msg);
+static void _server_log(struct server_logger * logger, enum server_logger_level log_level, const char * log_msg_fmt, ...);
 
 // ==== Conn ==== //
 static void _server_conn_conf(struct server_conn * conn, struct server_conn_conf * conn_conf);
@@ -68,7 +66,7 @@ server_pt server_init(server_conf_pt server_conf){
     }
 
     // Estado de servidor inicializado:
-    _server_log(&server->logger, LOG_INFO, "Servidor inicializado correctamente.");
+    _server_log(&server->logger, LOG_DEBUG, "Servidor inicializado correctamente en (%p).", server);
     server->state = SERVER_STATE_INITIALIZED;
     return server;
 }
@@ -113,7 +111,7 @@ bool server_close(server_pt server){
 
     // Detención de los hilos:
     server->state = SERVER_STATE_STOPPING;
-    _server_log(&server->logger, LOG_INFO, "Cerrando el servidor...");
+    _server_log(&server->logger, LOG_DEBUG, "Cerrando el servidor...");
     _server_worker_wait_land(&server->worker);
     _server_log(&server->logger, LOG_INFO, "Servidor cerrado correctamente.");
     server->state = SERVER_STATE_STOPPED;
@@ -276,11 +274,12 @@ static void _server_logger_conf(struct server_logger * logger, struct server_log
 
     @param struct server_logger * logger: Referencia al logger del servidor.
     @param enum server_logger_level log_level: Nivel al que se escribirá el log.
-    @param const char * log_msg: Mensaje que incluirá el log.
+    @param const char * log_msg_fmt: Mensaje y formato del que se desea hacer loggin.
+    @param ...: Número variable de argumentos, usados en conjunto con log_msg_fmt.
 
     @retval None.
 */
-static void _server_log(struct server_logger * logger, enum server_logger_level log_level, const char * log_msg){
+static void _server_log(struct server_logger * logger, enum server_logger_level log_level, const char * log_msg_fmt, ...){
     // Si el logger es inválido se ignora la llamada:
     if (!logger) return;
     if (logger->state != LOGGER_OK) return;
@@ -293,7 +292,14 @@ static void _server_log(struct server_logger * logger, enum server_logger_level 
     if (log_level < logger->log_min_lvl) return;
 
     // Si el puntero al mensaje de log es inválido se ignora la llamada:
-    if (!log_msg) return;
+    if (!log_msg_fmt) return;
+
+    // Mensaje formateado:
+    char log_msg[MAX_LOG_MSG_LEN];
+    va_list args;
+    va_start(args, log_msg_fmt);
+    vsnprintf(log_msg, sizeof(log_msg), log_msg_fmt, args);
+    va_end(args);
 
     // Si la longitud excede un máximo se ignora la llamada:
     if (strlen(log_msg) > MAX_LOG_MSG_LEN - LOG_RESERVED_FORMAT_LEN) return;
@@ -306,7 +312,7 @@ static void _server_log(struct server_logger * logger, enum server_logger_level 
     time_t actual_time = time(NULL);
     strftime(timestr, sizeof(timestr), "%Y-%m-%d %H:%M:%S", localtime(&actual_time));
 
-    char fullmsg[MAX_LOG_MSG_LEN];
+    char fullmsg[LOG_RESERVED_FORMAT_LEN + MAX_LOG_MSG_LEN];
     snprintf(fullmsg, sizeof(fullmsg), "[%s]%s: %s", timestr, LOG_LEVEL2STR(log_level), log_msg);
 
     // Caso de primera escritura del servidor al log:
@@ -565,8 +571,8 @@ static bool _server_worker_conf(struct server_worker * worker, struct server_wor
     worker->client_read_buffer_size = (worker_conf->client_read_buffer_size > 0) ? worker_conf->client_read_buffer_size : DEFAULT_CLIENT_READ_BUFFER_SIZE;
     worker->client_write_buffer_size = (worker_conf->client_write_buffer_size > 0) ? worker_conf->client_write_buffer_size : DEFAULT_CLIENT_WRITE_BUFFER_SIZE;
     worker->client_timeout = (worker_conf->client_timeout > 0) ? worker_conf->client_timeout : DEFAULT_CLIENT_TIMEOUT;
-    worker->on_client_rcv = (worker_conf->on_client_rcv) ? worker_conf->on_client_rcv : NULL;
-    worker->on_client_snd = (worker->on_client_snd) ? worker_conf->on_client_snd : NULL;
+    worker->on_client_rcv = worker_conf->on_client_rcv;
+    worker->on_client_snd = worker->on_client_snd;
 
     // Asignación de valores configurados (o por defecto - miembros dinámicos):
     worker->client_ctx = malloc(sizeof(struct server_client_ctx) * worker->num_workers);
@@ -736,6 +742,7 @@ static void _server_worker_wait_land(struct server_worker * worker){
 static bool ___server_cli_init(struct server_client_conn * client, size_t read_buffer_len, size_t write_buffer_len);
 static void ___server_cli_deinit(struct server_client_conn * client);
 static void ___server_cli_close(struct server_client_conn * client_conn, int epoll_fd, size_t * count);
+static void ___server_cli_check_timeout(time_t current_time, struct server_worker * worker, int epoll_fd, struct server_client_ctx * client_ctx, struct server_client_conn * clients);
 
 /*
     @brief Esta función es el hilo principal del servidor, gestiona las conexiones con los clientes y su distribución en los hilos de gestión de clientes.
@@ -844,6 +851,12 @@ static void * __server_main_worker(void * arg){
             ___server_cli_close(&worker->client[th_index][pos_index], worker->epoll_fd[th_index], &worker->client_count[th_index]);
             continue;
         }
+
+        // Loggin e impresión de datos del cliente conectado:
+        char ip_str[INET_ADDRSTRLEN] = {0};
+        if (inet_ntop(AF_INET, &client.addr.sin_addr, ip_str, sizeof(ip_str)) == NULL) ip_str[0] = '?';
+        int port = ntohs(client.addr.sin_port);
+        _server_log(logger, LOG_INFO, "Cliente conectado: %s:%d", ip_str, port);
     }
 
     return NULL;
@@ -876,23 +889,22 @@ static void * __server_cli_worker(void * arg){
 
         // Verificación de los timeouts de los clientes tras un evento:
         time_t current_time = time(NULL);
-        for (size_t i = 0; i < worker->client_capacity[client_ctx->client_index]; i++){
-            struct server_client_conn * temp_client = &clients[i];
-            if (temp_client->state != CLIENT_STATE_ESTABLISH) continue;
-            if (difftime(current_time, temp_client->last_action_time) <= worker->client_timeout) continue;
-            ___server_cli_close(temp_client, epoll_fd, &worker->client_count[client_ctx->client_index]);
-        }
+        ___server_cli_check_timeout(current_time, worker, epoll_fd, client_ctx, clients);
 
         // Gestión de los eventos capturados en los sockets para lectura de datos:
         for (size_t i = 0; i < nfds; i++){
             struct server_client_conn * client = (struct server_client_conn *)events[i].data.ptr;
             if (!client || (client->state != CLIENT_STATE_ESTABLISH)) continue;
 
+            char ip_str[INET_ADDRSTRLEN] = {0};
+            if (inet_ntop(AF_INET, &client->addr.sin_addr, ip_str, sizeof(ip_str)) == NULL) ip_str[0] = '?';
+            int port = ntohs(client->addr.sin_port);
+
             // Lectura de datos del cliente:
             if (events[i].events & EPOLLIN){
                 pthread_mutex_lock(client->read_lock);
                 int rb = SSL_read(client->ssl, client->read_buffer + client->read_off, worker->client_read_buffer_size - client->read_off);
-
+                
                 if (rb > 0){
                     // Caso recepción de datos:
                     client->read_len += rb;
@@ -901,9 +913,15 @@ static void * __server_cli_worker(void * arg){
                     // Procesado de los datos leídos:
                     worker->on_client_rcv(client);      // TODO: Desacoplar procesamiento del hilo (ahora, esta función es bloqueante)
 
+                    // Log de debug para registrar la lectura de datos del cliente:
+                    _server_log(client_logger, LOG_DEBUG, "Lectura - Se han leído datos del cliente %s:%d", ip_str, port);
+
                     // Liberación del mutex de lectura:
                     pthread_mutex_unlock(client->read_lock);
                 } else if ((rb == 0) || (SSL_get_error(client->ssl, rb) == SSL_ERROR_ZERO_RETURN)){
+                    // Log de info para registrar la desconexión de un cliente:
+                    _server_log(client_logger, LOG_INFO, "Lectura - Se ha desconectado el cliente %s:%d", ip_str, port);
+
                     // Caso cierre de conexión por parte del cliente:
                     pthread_mutex_unlock(client->read_lock);
                     ___server_cli_close(client, epoll_fd, &worker->client_count[client_ctx->client_index]);
@@ -911,6 +929,9 @@ static void * __server_cli_worker(void * arg){
                     // Caso error en la comunicación con el cliente:
                     int ssl_err = SSL_get_error(client->ssl, rb);
                     if ((ssl_err != SSL_ERROR_WANT_READ) && (ssl_err != SSL_ERROR_WANT_WRITE)){
+                        // Log de advertencia para registrar un error en un cliente:
+                        _server_log(client_logger, LOG_WARN, "Lectura - Se ha producido un error en el cliente %s:%d", ip_str, port);
+
                         pthread_mutex_unlock(client->read_lock);
                         ___server_cli_close(client, epoll_fd, &worker->client_count[client_ctx->client_index]);
                     }
@@ -931,8 +952,18 @@ static void * __server_cli_worker(void * arg){
                         client->write_off = 0;
                         client->write_len = 0;
 
-                        struct epoll_event ev = {.events = EPOLLIN, .data.ptr = client};        // Desactivación de evento de escritura libre cuando finaliza el mensaje.
-                        epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client->fd, &ev);
+                        struct epoll_event ev = {.events = EPOLLIN, .data.ptr = client};
+                       
+                        if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client->fd, &ev) == -1){
+                            // Log de advertencia para registrar un error en el cliente:
+                            _server_log(client_logger, LOG_WARN, "Escritura - Se ha producido un error en el cliente %s:%d", ip_str, port);
+
+                            pthread_mutex_unlock(client->write_lock);
+                            ___server_cli_close(client, epoll_fd, &worker->client_count[client_ctx->client_index]);
+                        }   
+
+                        // Log de debug para registrar la escritura en un cliente:
+                        _server_log(client_logger, LOG_DEBUG, "Escritura - Se han escrito datos al cliente %s:%d", ip_str, port);
                     }
                     client->last_action_time = current_time;
 
@@ -942,6 +973,9 @@ static void * __server_cli_worker(void * arg){
                     // Caso error en la comunicación con el cliente:
                     int ssl_err = SSL_get_error(client->ssl, wb);
                     if ((ssl_err != SSL_ERROR_WANT_READ) && (ssl_err != SSL_ERROR_WANT_WRITE)){
+                        // Log de advertencia para registrar un error en el cliente:
+                        _server_log(client_logger, LOG_WARN, "Escritura - Se ha producido un error en el cliente %s:%d", ip_str, port);
+
                         pthread_mutex_unlock(client->write_lock);
                         ___server_cli_close(client, epoll_fd, &worker->client_count[client_ctx->client_index]);
                     }
@@ -959,7 +993,9 @@ static void * __server_cli_worker(void * arg){
     return NULL;
 }
 
-
+// ================================================================ //
+// Funciones auxiliares para los clientes.
+// ================================================================ //
 /*
     @brief Función para alojar memoria e inicializar a 0's la estructura de un cliente.
     @note: Pensada para inicializar la estructura de un cliente previamente a su conexión, dentro del hilo principal del servidor.
@@ -1081,6 +1117,26 @@ static void ___server_cli_close(struct server_client_conn * client_conn, int epo
 
     client_conn->state = CLIENT_STATE_STANDBY;
     (*count)--;
+}
+
+/*
+    @brief Función para verificar los timeout de los clientes de un hilo gestor de clientes.
+
+    @param struct server_worker * worker: Referencia al worker del servidor.
+    @param int epoll_fd: Descriptor de archivo del epoll del hilo gestor.
+    @param struct server_client_ctx * client_ctx: Referencia al contexto de clientes del hilo gestor.
+    @param struct server_client_conn * clients: Referencia al array de clientes del hilo gestor.
+
+    @retval None.
+*/
+static void ___server_cli_check_timeout(time_t current_time, struct server_worker * worker, int epoll_fd, struct server_client_ctx * client_ctx, struct server_client_conn * clients){
+    // Verificación de los timeouts:
+    for (size_t i = 0; i < worker->client_capacity[client_ctx->client_index]; i++){
+        struct server_client_conn * temp_client = &clients[i];
+        if (temp_client->state != CLIENT_STATE_ESTABLISH) continue;
+        if (difftime(current_time, temp_client->last_action_time) <= worker->client_timeout) continue;
+        ___server_cli_close(temp_client, epoll_fd, &worker->client_count[client_ctx->client_index]);
+    }
 }
 /* -------------------------------------------------------------------------------------------------------------------------------- */
 /* -------------------------------------------------------------------------------------------------------------------------------- */

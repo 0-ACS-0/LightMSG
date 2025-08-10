@@ -5,7 +5,7 @@ int main(int argc, char ** argv){
 
     server_pt server = server_init(&(server_conf_t){
         .logger_conf.log_max_size = 8000,
-        .logger_conf.log_min_lvl = 1,
+        .logger_conf.log_min_lvl = 0,
         .logger_conf.log_path = "./logs",
         .logger_conf.log_file = "server",
 
@@ -20,27 +20,13 @@ int main(int argc, char ** argv){
         .worker_conf.client_timeout = 600
     });
 
-    printf("Servidor creado en (%p)\n", server);
     server_open(server);
-    printf("Servidor abierto!\n");
 
-    char ch = 'a';
-    while(ch != 'q'){
-        printf("Pulsa 'q' para cerrar: ");
-        ch = fgetc(stdin);
-    }
+    printf("\nPulsa 'enter' para cerrar el servidor.\n");
+    fgetc(stdin);
 
     server_close(server);
-    printf("Servidor cerrado!\n");
-
     server_deinit(&server);
 
     return 0;
-}
-
-/*
-    @
-*/
-void rcvfn_echo(void * args){
-    printf("%s\n", (char *)args);
 }
