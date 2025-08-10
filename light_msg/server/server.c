@@ -1,6 +1,9 @@
 #include "server.h"
 #include <netinet/in.h>
+#include <pthread.h>
 #include <string.h>
+#include <sys/epoll.h>
+#include <sys/socket.h>
 
 
 /* -------------------------------------------------------------------------------------------------------------------------------- */
@@ -486,9 +489,7 @@ static bool _server_conn_init(struct server_conn * conn){
     }
 
     // Inicialización de la capa TLS:
-    SSL_library_init();
-    SSL_load_error_strings();
-    OpenSSL_add_all_algorithms();
+    OPENSSL_init_ssl(0, NULL);
 
     // Establecimiento del método de cifrado y creación del contexto del servidor:
     conn->ssl_method = TLS_server_method();
@@ -574,6 +575,8 @@ static bool _server_worker_conf(struct server_worker * worker, struct server_wor
     worker->on_client_rcv = worker_conf->on_client_rcv;
     worker->on_client_snd = worker->on_client_snd;
 
+    if (pthread_mutex_init(&worker->realloc_lock, NULL) != 0) return true;
+
     // Asignación de valores configurados (o por defecto - miembros dinámicos):
     worker->client_ctx = malloc(sizeof(struct server_client_ctx) * worker->num_workers);
     if (!worker->client_ctx) return true;
@@ -602,7 +605,7 @@ static bool _server_worker_conf(struct server_worker * worker, struct server_wor
         worker->client_ctx[i].server_worker = worker;
         worker->client_ctx[i].server_logger = server_logger;
         worker->client_ctx[i].server_state = server_state;
-        worker->client_ctx[i].client_index = i;
+        worker->client_ctx[i].thread_index = i;
         if (worker->client[i]) continue;
         _server_worker_deinit(worker);
         return true;
@@ -810,12 +813,16 @@ static void * __server_main_worker(void * arg){
         }
 
         if (worker->client_count[th_index] == worker->client_capacity[th_index]){
+            // Lock de seguridad para evitar accesos no permitidos durante la reasignación de memoria:
+            pthread_mutex_lock(&worker->realloc_lock);
+
             // Se comprueba que el número de clientes no excede el máximo permitido:
             if ((worker->client_capacity[th_index] + worker->client_capacity_block) >= MAX_WORKER_CLIENT_NUM){
                 SSL_shutdown(client.ssl);
                 SSL_free(client.ssl);
                 close(client.fd);
                 ___server_cli_deinit(&client);
+                pthread_mutex_unlock(&worker->realloc_lock);
                 continue;
             }
 
@@ -826,15 +833,26 @@ static void * __server_main_worker(void * arg){
                 SSL_free(client.ssl);
                 close(client.fd);
                 ___server_cli_deinit(&client);
+                pthread_mutex_unlock(&worker->realloc_lock);
                 continue;
             }
             worker->client[th_index] = temp;
-            worker->client_capacity[th_index] += worker->client_capacity_block;
+
+            // Se inicializan las nuevas estructuras:
+            size_t prev_capacity = worker->client_capacity[th_index];
+            size_t new_capacity = worker->client_capacity[th_index] + worker->client_capacity_block;
+            for (size_t i = prev_capacity; i < new_capacity; i++){
+                memset(&worker->client[th_index][i], 0, sizeof(struct server_client_conn));
+                worker->client[th_index][i].state = CLIENT_STATE_STANDBY;
+            }
+            worker->client_capacity[th_index] = new_capacity;
+
+            pthread_mutex_unlock(&worker->realloc_lock);
         }
 
+        // En el hilo seleccionado, se copia el cliente en el primer slot libre de clientes del hilo:
         size_t pos_index = 0;
         for (size_t i = 0; i < worker->client_capacity[th_index]; i++){
-            // En el hilo seleccionado, se copia el cliente en el primer slot libre de clientes del hilo:
             if (worker->client[th_index][i].state != CLIENT_STATE_STANDBY) continue;
             pos_index = i;
             worker->client[th_index][i] = client;
@@ -843,11 +861,11 @@ static void * __server_main_worker(void * arg){
             break;
         }
 
+        // Se añade el tipo de eventos a escuchar y el descriptor socket al epoll del hilo. (La estructura event es copiada internamente en la función ctl).
         struct epoll_event event;
         event.events = EPOLLIN;
-        event.data.ptr = &worker->client[th_index][pos_index];
+        event.data.u64 = pos_index;
         if(epoll_ctl(worker->epoll_fd[th_index], EPOLL_CTL_ADD, client.fd, &event) == -1){
-            // Se añade el tipo de eventos a escuchar y el descriptor socket al epoll del hilo. (La estructura event es copiada internamente en la función ctl).
             ___server_cli_close(&worker->client[th_index][pos_index], worker->epoll_fd[th_index], &worker->client_count[th_index]);
             continue;
         }
@@ -877,9 +895,8 @@ static void * __server_cli_worker(void * arg){
     struct server_client_ctx * client_ctx = (struct server_client_ctx *)arg;
     struct server_logger * client_logger = client_ctx->server_logger;
     struct server_worker * worker = client_ctx->server_worker;
-    struct server_client_conn * clients = worker->client[client_ctx->client_index];
 
-    int epoll_fd = worker->epoll_fd[client_ctx->client_index];
+    int epoll_fd = worker->epoll_fd[client_ctx->thread_index];
     struct epoll_event events[MAX_EPOLL_EVENTS];
 
     while (*client_ctx->server_state == SERVER_STATE_RUNNING){
@@ -887,13 +904,16 @@ static void * __server_cli_worker(void * arg){
         int nfds = epoll_wait(epoll_fd, events, MAX_EPOLL_EVENTS, 1000);
         if ((nfds < 0) && (errno == EINTR)) continue;
 
-        // Verificación de los timeouts de los clientes tras un evento:
+        // Tiempo actual en esta iteración:
         time_t current_time = time(NULL);
-        ___server_cli_check_timeout(current_time, worker, epoll_fd, client_ctx, clients);
+
+        // Lock para evitar problemas de acceso al producirse un realojamiento en memoria:
+        pthread_mutex_lock(&worker->realloc_lock);
 
         // Gestión de los eventos capturados en los sockets para lectura de datos:
         for (size_t i = 0; i < nfds; i++){
-            struct server_client_conn * client = (struct server_client_conn *)events[i].data.ptr;
+            uint64_t client_index = events[i].data.u64;
+            struct server_client_conn * client = &worker->client[client_ctx->thread_index][client_index];
             if (!client || (client->state != CLIENT_STATE_ESTABLISH)) continue;
 
             char ip_str[INET_ADDRSTRLEN] = {0};
@@ -902,6 +922,7 @@ static void * __server_cli_worker(void * arg){
 
             // Lectura de datos del cliente:
             if (events[i].events & EPOLLIN){
+                if (!client->ssl) continue;
                 pthread_mutex_lock(client->read_lock);
                 int rb = SSL_read(client->ssl, client->read_buffer + client->read_off, worker->client_read_buffer_size - client->read_off);
                 
@@ -911,7 +932,7 @@ static void * __server_cli_worker(void * arg){
                     client->last_action_time = current_time;
 
                     // Procesado de los datos leídos:
-                    worker->on_client_rcv(client);      // TODO: Desacoplar procesamiento del hilo (ahora, esta función es bloqueante)
+                    if(worker->on_client_rcv) worker->on_client_rcv(client);      // TODO: Desacoplar procesamiento del hilo (ahora, esta función es bloqueante)
 
                     // Log de debug para registrar la lectura de datos del cliente:
                     _server_log(client_logger, LOG_DEBUG, "Lectura - Se han leído datos del cliente %s:%d", ip_str, port);
@@ -924,7 +945,8 @@ static void * __server_cli_worker(void * arg){
 
                     // Caso cierre de conexión por parte del cliente:
                     pthread_mutex_unlock(client->read_lock);
-                    ___server_cli_close(client, epoll_fd, &worker->client_count[client_ctx->client_index]);
+                    ___server_cli_close(client, epoll_fd, &worker->client_count[client_ctx->thread_index]);
+                    continue;
                 } else {
                     // Caso error en la comunicación con el cliente:
                     int ssl_err = SSL_get_error(client->ssl, rb);
@@ -933,7 +955,8 @@ static void * __server_cli_worker(void * arg){
                         _server_log(client_logger, LOG_WARN, "Lectura - Se ha producido un error en el cliente %s:%d", ip_str, port);
 
                         pthread_mutex_unlock(client->read_lock);
-                        ___server_cli_close(client, epoll_fd, &worker->client_count[client_ctx->client_index]);
+                        ___server_cli_close(client, epoll_fd, &worker->client_count[client_ctx->thread_index]);
+                        continue;
                     }
                 }
             }
@@ -941,6 +964,7 @@ static void * __server_cli_worker(void * arg){
 
             // Escritura de datos del cliente:
             if ((client->write_len > 0) && (events[i].events & EPOLLOUT)){
+                if (!client->ssl) continue;
                 pthread_mutex_lock(client->write_lock);
                 int wb = SSL_write(client->ssl, client->write_buffer + client->write_off, client->write_len - client->write_off);
 
@@ -952,14 +976,15 @@ static void * __server_cli_worker(void * arg){
                         client->write_off = 0;
                         client->write_len = 0;
 
-                        struct epoll_event ev = {.events = EPOLLIN, .data.ptr = client};
+                        struct epoll_event ev = {.events = EPOLLIN, .data.u64 = client_index};
                        
                         if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client->fd, &ev) == -1){
                             // Log de advertencia para registrar un error en el cliente:
                             _server_log(client_logger, LOG_WARN, "Escritura - Se ha producido un error en el cliente %s:%d", ip_str, port);
 
                             pthread_mutex_unlock(client->write_lock);
-                            ___server_cli_close(client, epoll_fd, &worker->client_count[client_ctx->client_index]);
+                            ___server_cli_close(client, epoll_fd, &worker->client_count[client_ctx->thread_index]);
+                            continue;
                         }   
 
                         // Log de debug para registrar la escritura en un cliente:
@@ -977,17 +1002,23 @@ static void * __server_cli_worker(void * arg){
                         _server_log(client_logger, LOG_WARN, "Escritura - Se ha producido un error en el cliente %s:%d", ip_str, port);
 
                         pthread_mutex_unlock(client->write_lock);
-                        ___server_cli_close(client, epoll_fd, &worker->client_count[client_ctx->client_index]);
+                        ___server_cli_close(client, epoll_fd, &worker->client_count[client_ctx->thread_index]);
+                        continue;
                     }
                 }
             }
 
         }
+        // Verificación de los timeout de los clientes conectados tras una operación:
+        ___server_cli_check_timeout(current_time, worker, epoll_fd, client_ctx, worker->client[client_ctx->thread_index]);
+
+        // Se libera el mutex de realojamiento de memoria:
+        pthread_mutex_unlock(&worker->realloc_lock);
     }
 
     // Cierre completo de los clientes conectados al hilo:
-    for (size_t i = 0; i < worker->client_capacity[client_ctx->client_index]; i++){
-        ___server_cli_close(&clients[i], epoll_fd, &worker->client_count[client_ctx->client_index]);
+    for (size_t i = 0; i < worker->client_capacity[client_ctx->thread_index]; i++){
+        ___server_cli_close(&worker->client[client_ctx->thread_index][i], epoll_fd, &worker->client_count[client_ctx->thread_index]);
     }
 
     return NULL;
@@ -1075,16 +1106,27 @@ static void ___server_cli_deinit(struct server_client_conn * client){
     if (!client) return;
 
     // Liberación de recursos de la estructura del cliente:
-    free(client->read_buffer);
-    client->read_buffer = NULL;
-    free(client->write_buffer);
-    client->write_buffer = NULL;
-    pthread_mutex_destroy(client->read_lock);
-    free(client->read_lock);
-    client->read_lock = NULL;
-    pthread_mutex_destroy(client->write_lock);
-    free(client->write_lock);
-    client->write_lock = NULL;
+    if (client->read_buffer){
+        free(client->read_buffer);
+        client->read_buffer = NULL;
+    }
+
+    if (client->write_buffer){
+        free(client->write_buffer);
+        client->write_buffer = NULL;
+    }
+
+    if (client->read_lock){
+        pthread_mutex_destroy(client->read_lock);
+        free(client->read_lock);
+        client->read_lock = NULL;
+    }
+
+    if (client->write_lock){
+        pthread_mutex_destroy(client->write_lock);
+        free(client->write_lock);
+        client->write_lock = NULL;
+    }
 }
 
 /*
@@ -1109,6 +1151,7 @@ static void ___server_cli_close(struct server_client_conn * client_conn, int epo
     if (client_conn->ssl){
         SSL_shutdown(client_conn->ssl);
         SSL_free(client_conn->ssl);
+        client_conn->ssl = NULL;
     }
 
     close(client_conn->fd);
@@ -1131,11 +1174,11 @@ static void ___server_cli_close(struct server_client_conn * client_conn, int epo
 */
 static void ___server_cli_check_timeout(time_t current_time, struct server_worker * worker, int epoll_fd, struct server_client_ctx * client_ctx, struct server_client_conn * clients){
     // Verificación de los timeouts:
-    for (size_t i = 0; i < worker->client_capacity[client_ctx->client_index]; i++){
+    for (size_t i = 0; i < worker->client_capacity[client_ctx->thread_index]; i++){
         struct server_client_conn * temp_client = &clients[i];
         if (temp_client->state != CLIENT_STATE_ESTABLISH) continue;
         if (difftime(current_time, temp_client->last_action_time) <= worker->client_timeout) continue;
-        ___server_cli_close(temp_client, epoll_fd, &worker->client_count[client_ctx->client_index]);
+        ___server_cli_close(temp_client, epoll_fd, &worker->client_count[client_ctx->thread_index]);
     }
 }
 /* -------------------------------------------------------------------------------------------------------------------------------- */
