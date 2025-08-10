@@ -5,7 +5,7 @@ int main(int argc, char ** argv){
 
     server_pt server = server_init(&(server_conf_t){
         .logger_conf.log_max_size = 8000,
-        .logger_conf.log_min_lvl = 0,
+        .logger_conf.log_min_lvl = 1,
         .logger_conf.log_path = "./logs",
         .logger_conf.log_file = "server",
 
@@ -36,4 +36,11 @@ int main(int argc, char ** argv){
     server_deinit(&server);
 
     return 0;
+}
+
+/*
+    @
+*/
+void rcvfn_echo(void * args){
+    printf("%s\n", (char *)args);
 }

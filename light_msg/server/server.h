@@ -2,8 +2,6 @@
 #define _SERVER_HEADER
 
 
-
-
 /* ---------------------------------------------------------------- */
 /* ---- Librerías ------------------------------------------------- */
 // Estándar:
@@ -194,10 +192,12 @@ struct server_client_conn{
 
     // Buffer de datos del cliente (lecutra/escritura):
     char * read_buffer;
+    pthread_mutex_t * read_lock;
     size_t read_len;
     size_t read_off;
 
     char * write_buffer;
+    pthread_mutex_t * write_lock;
     size_t write_len;
     size_t write_off;
 
@@ -211,8 +211,9 @@ struct server_client_conn{
 // Estructura con el contexto de trabajo para el hilo de gestión de clientes.
 struct server_client_ctx{
     struct server_worker * server_worker;
-    size_t client_index;
+    struct server_logger * server_logger;
     enum server_state * server_state;
+    size_t client_index;
 };
 
 // Estructura con los datos de los hilos:
@@ -236,6 +237,10 @@ struct server_worker{
     size_t client_read_buffer_size;
     size_t client_write_buffer_size;
     time_t client_timeout;
+
+    // Funciones a realizar sobre los datos de los clientes:
+    void (*on_client_rcv)(void * args);
+    void (*on_client_snd)(void * args);
 };
 
 // Estructura con los datos de configuración de los hilos:
@@ -250,6 +255,10 @@ struct server_worker_conf{
     size_t client_read_buffer_size;
     size_t client_write_buffer_size;
     time_t client_timeout;
+
+    // Configuración de las funciones de procesado de datos de los clientes:
+    void (*on_client_rcv)(void * args);
+    void (*on_client_snd)(void * args);
 };
 
 // Estructura global del servidor:

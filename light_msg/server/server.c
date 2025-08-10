@@ -1,4 +1,8 @@
 #include "server.h"
+#include <bits/pthreadtypes.h>
+#include <pthread.h>
+#include <stdlib.h>
+#include <unistd.h>
 
 
 /* -------------------------------------------------------------------------------------------------------------------------------- */
@@ -15,7 +19,7 @@ static bool _server_conn_init(struct server_conn * conn);
 static void _server_conn_deinit(struct server_conn * conn);
 
 // ==== Worker ==== //
-static bool _server_worker_conf(struct server_worker * worker, struct server_worker_conf * worker_conf, enum server_state * server_state);
+static bool _server_worker_conf(struct server_worker * worker, struct server_worker_conf * worker_conf, struct server_logger * server_logger, enum server_state * server_state);
 static void _server_worker_deinit(struct server_worker * worker);
 static bool _server_worker_launch(server_pt server);
 static void _server_worker_wait_land(struct server_worker * worker);
@@ -53,7 +57,7 @@ server_pt server_init(server_conf_pt server_conf){
     err |= _server_conn_init(&server->conn);
 
     // Inicialización y configuración del worker del servidor:
-    err |= _server_worker_conf(&server->worker, &server_conf->worker_conf, &server->state);
+    err |= _server_worker_conf(&server->worker, &server_conf->worker_conf, &server->logger, &server->state);
 
     // Comprobación de errores de inicialización internos:
     if (err){
@@ -64,6 +68,7 @@ server_pt server_init(server_conf_pt server_conf){
     }
 
     // Estado de servidor inicializado:
+    _server_log(&server->logger, LOG_INFO, "Servidor inicializado correctamente.");
     server->state = SERVER_STATE_INITIALIZED;
     return server;
 }
@@ -84,10 +89,12 @@ bool server_open(server_pt server){
     // Lanzamiento de hilos de recepción y gestión de clientes:
     server->state = SERVER_STATE_RUNNING;
     if(_server_worker_launch(server)){
+        _server_log(&server->logger, LOG_WARN, "No ha sido posible abrir correctamente el servidor.");
         server->state = SERVER_STATE_INITIALIZED;
         return true;
     }
 
+    _server_log(&server->logger, LOG_INFO, "Servidor abierto correctamente.");
     return false;
 }
 
@@ -106,7 +113,9 @@ bool server_close(server_pt server){
 
     // Detención de los hilos:
     server->state = SERVER_STATE_STOPPING;
+    _server_log(&server->logger, LOG_INFO, "Cerrando el servidor...");
     _server_worker_wait_land(&server->worker);
+    _server_log(&server->logger, LOG_INFO, "Servidor cerrado correctamente.");
     server->state = SERVER_STATE_STOPPED;
 
     return false;
@@ -126,6 +135,8 @@ bool server_deinit(server_pt * server){
     // Comprobación de servidor válido:
     if ((!server) || (!(*server))) return true;
     if (((*server)->state != SERVER_STATE_STOPPED) && ((*server)->state != SERVER_STATE_INITIALIZED)) return true;
+
+    _server_log(&(*server)->logger, LOG_INFO, "Servidor desinicializado.");
 
     // Desinicialización del worker:
     _server_worker_deinit(&(*server)->worker);
@@ -535,7 +546,7 @@ static void * __server_cli_worker(void * arg);
     @retval true: Error en la inicialización de workers del servidor.
     @retval false: No han ocurrido errores.
 */
-static bool _server_worker_conf(struct server_worker * worker, struct server_worker_conf * worker_conf, enum server_state * server_state){
+static bool _server_worker_conf(struct server_worker * worker, struct server_worker_conf * worker_conf, struct server_logger * server_logger, enum server_state * server_state){
     // Comprobación de estructuras válidas:
     if (worker == NULL) return true;
     if (worker_conf == NULL) return true;
@@ -554,6 +565,8 @@ static bool _server_worker_conf(struct server_worker * worker, struct server_wor
     worker->client_read_buffer_size = (worker_conf->client_read_buffer_size > 0) ? worker_conf->client_read_buffer_size : DEFAULT_CLIENT_READ_BUFFER_SIZE;
     worker->client_write_buffer_size = (worker_conf->client_write_buffer_size > 0) ? worker_conf->client_write_buffer_size : DEFAULT_CLIENT_WRITE_BUFFER_SIZE;
     worker->client_timeout = (worker_conf->client_timeout > 0) ? worker_conf->client_timeout : DEFAULT_CLIENT_TIMEOUT;
+    worker->on_client_rcv = (worker_conf->on_client_rcv) ? worker_conf->on_client_rcv : NULL;
+    worker->on_client_snd = (worker->on_client_snd) ? worker_conf->on_client_snd : NULL;
 
     // Asignación de valores configurados (o por defecto - miembros dinámicos):
     worker->client_ctx = malloc(sizeof(struct server_client_ctx) * worker->num_workers);
@@ -581,8 +594,9 @@ static bool _server_worker_conf(struct server_worker * worker, struct server_wor
         worker->client[i] = calloc(worker->client_capacity_block, sizeof(struct server_client_conn));
         worker->client_capacity[i] = worker->client_capacity_block;
         worker->client_ctx[i].server_worker = worker;
-        worker->client_ctx[i].client_index = i;
+        worker->client_ctx[i].server_logger = server_logger;
         worker->client_ctx[i].server_state = server_state;
+        worker->client_ctx[i].client_index = i;
         if (worker->client[i]) continue;
         _server_worker_deinit(worker);
         return true;
@@ -665,11 +679,13 @@ static bool _server_worker_launch(server_pt server){
     if (!server) return true;
 
     struct server_worker * worker = &server->worker;
+    struct server_logger * logger = &server->logger;
 
     // Lanzamiento de los hilos que gestionan los clientes:
     for (size_t i = 0; i < worker->num_workers; i++){
 
         if(pthread_create(&worker->thread[i], NULL, __server_cli_worker, (void *)&worker->client_ctx[i]) == 0) continue;
+        _server_log(logger, LOG_ERR, "No se han podido lanzar los hilos de gestión de clientes.");
         for (ssize_t j = (ssize_t)i-1; j >= 0; j--){
             pthread_cancel(worker->thread[j]);
             pthread_join(worker->thread[j],NULL);
@@ -679,6 +695,7 @@ static bool _server_worker_launch(server_pt server){
 
     // Lanzamiento del hilo que gestiona las conexiones:
     if(pthread_create(&worker->main_thread, NULL, __server_main_worker, (void *)server) != 0){
+        _server_log(logger, LOG_ERR, "No se ha podido lanzar el hilo principal del servidor de gestión de conexiones.");
         for (size_t i = 0; i < worker->num_workers; i++){
             pthread_cancel(worker->thread[i]);
             pthread_join(worker->thread[i], NULL);
@@ -716,6 +733,8 @@ static void _server_worker_wait_land(struct server_worker * worker){
 // ================================================================ //
 // Hilos de gestión del servidor.
 // ================================================================ //
+static bool ___server_cli_init(struct server_client_conn * client, size_t read_buffer_len, size_t write_buffer_len);
+static void ___server_cli_deinit(struct server_client_conn * client);
 static void ___server_cli_close(struct server_client_conn * client_conn, int epoll_fd, size_t * count);
 
 /*
@@ -735,41 +754,28 @@ static void * __server_main_worker(void * arg){
     struct server_conn * conn = &server->conn;
     struct server_worker * worker = &server->worker;
 
+    // Estructura genérica de la conexión del cliente:
+    struct server_client_conn client;
+    socklen_t client_len = sizeof(client.addr);
+
     // Bucle principal:
     while (server->state == SERVER_STATE_RUNNING){
-        // Se crea temporalmente en esta iteración, la estructura de conexión de un cliente completo:
-        struct server_client_conn client;
-        socklen_t client_len = sizeof(client);
-
-        client.read_buffer = calloc(worker->client_read_buffer_size, sizeof(char));
-        if (!client.read_buffer) continue;
-        client.write_buffer = calloc(worker->client_write_buffer_size, sizeof(char));
-        if (!client.write_buffer){
-            free(client.read_buffer);
-            continue;
-        }
-
-        client.read_len = 0;
-        client.read_off = 0;
-        client.write_len = 0;
-        client.write_off = 0;
-        client.last_action_time = time(NULL);
-        client.state = CLIENT_STATE_STANDBY;
+        // Se crean los buffers y mutex de un cliente nuevo (en la estructura local client de manera temporal, tras una conexión estas referencias se copian a las estructuras
+        // internas de los hilos de gestión de clientes).
+        if (___server_cli_init(&client, worker->client_read_buffer_size, worker->client_write_buffer_size)) continue;
 
         // Se acepta la conexión en la capa TCP:
         client.fd = accept(conn->fd, (struct sockaddr *)&client.addr, &client_len);
         if (client.fd < 0){
             if ((errno == EAGAIN) || (errno == EWOULDBLOCK)) usleep(10000);
-            free(client.read_buffer);
-            free(client.write_buffer);
+            ___server_cli_deinit(&client);
             continue;
         }
 
         // Se establece el socket del cliente como no bloqueante:
         if (fcntl(client.fd, F_SETFL, O_NONBLOCK) < 0){
             close(client.fd);
-            free(client.read_buffer);
-            free(client.write_buffer);
+            ___server_cli_deinit(&client);
             continue;
         }
 
@@ -777,8 +783,7 @@ static void * __server_main_worker(void * arg){
         client.ssl = SSL_new(conn->ssl_ctx);
         if(!client.ssl){
             close(client.fd);
-            free(client.read_buffer);
-            free(client.write_buffer);
+            ___server_cli_deinit(&client);
             continue;
         }
 
@@ -786,8 +791,7 @@ static void * __server_main_worker(void * arg){
         if (SSL_accept(client.ssl) <= 0){
             SSL_free(client.ssl);
             close(client.fd);
-            free(client.read_buffer);
-            free(client.write_buffer);
+            ___server_cli_deinit(&client);
             continue;
         }
 
@@ -804,8 +808,7 @@ static void * __server_main_worker(void * arg){
                 SSL_shutdown(client.ssl);
                 SSL_free(client.ssl);
                 close(client.fd);
-                free(client.read_buffer);
-                free(client.write_buffer);
+                ___server_cli_deinit(&client);
                 continue;
             }
 
@@ -815,8 +818,7 @@ static void * __server_main_worker(void * arg){
                 SSL_shutdown(client.ssl);
                 SSL_free(client.ssl);
                 close(client.fd);
-                free(client.read_buffer);
-                free(client.write_buffer);
+                ___server_cli_deinit(&client);
                 continue;
             }
             worker->client[th_index] = temp;
@@ -839,13 +841,8 @@ static void * __server_main_worker(void * arg){
         event.data.ptr = &worker->client[th_index][pos_index];
         if(epoll_ctl(worker->epoll_fd[th_index], EPOLL_CTL_ADD, client.fd, &event) == -1){
             // Se añade el tipo de eventos a escuchar y el descriptor socket al epoll del hilo. (La estructura event es copiada internamente en la función ctl).
-            SSL_shutdown(client.ssl);
-            SSL_free(client.ssl);
-            close(client.fd);
-            free(client.read_buffer);
-            free(client.write_buffer);
-            worker->client[th_index][pos_index].state = CLIENT_STATE_STANDBY;
-            worker->client_count[th_index]--; 
+            ___server_cli_close(&worker->client[th_index][pos_index], worker->epoll_fd[th_index], &worker->client_count[th_index]);
+            continue;
         }
     }
 
@@ -865,6 +862,7 @@ static void * __server_cli_worker(void * arg){
 
     // Estructura del contexto del cliente asignado al hilo:
     struct server_client_ctx * client_ctx = (struct server_client_ctx *)arg;
+    struct server_logger * client_logger = client_ctx->server_logger;
     struct server_worker * worker = client_ctx->server_worker;
     struct server_client_conn * clients = worker->client[client_ctx->client_index];
 
@@ -891,55 +889,65 @@ static void * __server_cli_worker(void * arg){
             if (!client || (client->state != CLIENT_STATE_ESTABLISH)) continue;
 
             // Lectura de datos del cliente:
-            if (!(events[i].events & EPOLLIN)) continue;
-            int rb = SSL_read(client->ssl, client->read_buffer + client->read_off, worker->client_read_buffer_size - client->read_off);
-            if (rb > 0){
-                // Caso recepción de datos:
-                client->read_len += rb;
-                client->last_action_time = current_time;
+            if (events[i].events & EPOLLIN){
+                pthread_mutex_lock(client->read_lock);
+                int rb = SSL_read(client->ssl, client->read_buffer + client->read_off, worker->client_read_buffer_size - client->read_off);
 
-                // TODO: Función para procesar los datos leídos del cliente. (Idea: Puntero a función en server_client_ctx)
-            } else if ((rb == 0) || (SSL_get_error(client->ssl, rb) == SSL_ERROR_ZERO_RETURN)){
-                // Caso cierre de conexión por parte del cliente:
-                ___server_cli_close(client, epoll_fd, &worker->client_count[client_ctx->client_index]);
-            } else {
-                // Caso error en la comunicación con el cliente:
-                int ssl_err = SSL_get_error(client->ssl, rb);
-                if ((ssl_err != SSL_ERROR_WANT_READ) && (ssl_err != SSL_ERROR_WANT_WRITE)){
+                if (rb > 0){
+                    // Caso recepción de datos:
+                    client->read_len += rb;
+                    client->last_action_time = current_time;
+
+                    // Procesado de los datos leídos:
+                    worker->on_client_rcv(client);      // TODO: Desacoplar procesamiento del hilo (ahora, esta función es bloqueante)
+
+                    // Liberación del mutex de lectura:
+                    pthread_mutex_unlock(client->read_lock);
+                } else if ((rb == 0) || (SSL_get_error(client->ssl, rb) == SSL_ERROR_ZERO_RETURN)){
+                    // Caso cierre de conexión por parte del cliente:
+                    pthread_mutex_unlock(client->read_lock);
                     ___server_cli_close(client, epoll_fd, &worker->client_count[client_ctx->client_index]);
+                } else {
+                    // Caso error en la comunicación con el cliente:
+                    int ssl_err = SSL_get_error(client->ssl, rb);
+                    if ((ssl_err != SSL_ERROR_WANT_READ) && (ssl_err != SSL_ERROR_WANT_WRITE)){
+                        pthread_mutex_unlock(client->read_lock);
+                        ___server_cli_close(client, epoll_fd, &worker->client_count[client_ctx->client_index]);
+                    }
                 }
             }
-        }
 
-        // Gestión de los eventos capturados en el socket para escritura de datos:
-        for (size_t i = 0; i < nfds; i++){
-            // Escucha de eventos en los sockets clientes asignados al hilo:
-            struct server_client_conn * client = (struct server_client_conn *)events[i].data.ptr;
-            if (!client || (client->state != CLIENT_STATE_ESTABLISH)) continue;
 
             // Escritura de datos del cliente:
-            if ((client->write_len == 0) || !(events[i].events & EPOLLOUT)) continue;
-            int wb = SSL_write(client->ssl, client->write_buffer + client->write_off, client->write_len - client->write_off);
+            if ((client->write_len > 0) && (events[i].events & EPOLLOUT)){
+                pthread_mutex_lock(client->write_lock);
+                int wb = SSL_write(client->ssl, client->write_buffer + client->write_off, client->write_len - client->write_off);
 
-            if (wb > 0){
-                // Caso escritura de datos:
-                client->write_off += wb;
-                if (client->write_off == client->write_len){
-                    // Caso toda la respuesta enviada:
-                    client->write_off = 0;
-                    client->write_len = 0;
+                if (wb > 0){
+                    // Caso escritura de datos:
+                    client->write_off += wb;
+                    if (client->write_off == client->write_len){
+                        // Caso toda la respuesta enviada:
+                        client->write_off = 0;
+                        client->write_len = 0;
 
-                    struct epoll_event ev = {.events = EPOLLIN, .data.ptr = client};        // Desactivación de evento de escritura libre cuando finaliza el mensaje.
-                    epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client->fd, &ev);
-                }
-                client->last_action_time = current_time;
-            } else {
-                // Caso error en la comunicación con el cliente:
-                int ssl_err = SSL_get_error(client->ssl, wb);
-                if ((ssl_err != SSL_ERROR_WANT_READ) && (ssl_err != SSL_ERROR_WANT_WRITE)){
-                    ___server_cli_close(client, epoll_fd, &worker->client_count[client_ctx->client_index]);
+                        struct epoll_event ev = {.events = EPOLLIN, .data.ptr = client};        // Desactivación de evento de escritura libre cuando finaliza el mensaje.
+                        epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client->fd, &ev);
+                    }
+                    client->last_action_time = current_time;
+
+                    // Liberación del mutex de escritura:
+                    pthread_mutex_unlock(client->write_lock);
+                } else {
+                    // Caso error en la comunicación con el cliente:
+                    int ssl_err = SSL_get_error(client->ssl, wb);
+                    if ((ssl_err != SSL_ERROR_WANT_READ) && (ssl_err != SSL_ERROR_WANT_WRITE)){
+                        pthread_mutex_unlock(client->write_lock);
+                        ___server_cli_close(client, epoll_fd, &worker->client_count[client_ctx->client_index]);
+                    }
                 }
             }
+
         }
     }
 
@@ -951,8 +959,101 @@ static void * __server_cli_worker(void * arg){
     return NULL;
 }
 
+
+/*
+    @brief Función para alojar memoria e inicializar a 0's la estructura de un cliente.
+    @note: Pensada para inicializar la estructura de un cliente previamente a su conexión, dentro del hilo principal del servidor.
+
+    @param struct server_client_conn * client: Referencia a la estructura de conexión del cliente.
+    @param size_t read_buffer_len: Longitud del buffer de lectura del cliente.
+    @param size_t write_buffer_len: Longitud del buffer de escritura del cliente.
+
+    @retval true: Han ocurrido errores durante la inicialización.
+    @retval false: No han ocurrido errores.
+*/
+static bool ___server_cli_init(struct server_client_conn * client, size_t read_buffer_len, size_t write_buffer_len){
+    // Comprobación de referencia a referencia válida:
+    if (!client) return true;
+
+    // Alojamiento de memoria para los buffers del nuevo cliente a conectarse:
+    client->read_buffer = calloc(read_buffer_len, sizeof(char));
+    if (!client->read_buffer) return true;
+    client->write_buffer = calloc(write_buffer_len, sizeof(char));
+    if (!client->write_buffer){
+        free(client->read_buffer);
+        return true;
+    }
+
+    // Alojamiento de memoria de los locks de los buffers:
+    client->read_lock = malloc(sizeof(pthread_mutex_t));
+    if (!client->read_lock){
+        free(client->read_buffer);
+        free(client->write_buffer);
+        return true;
+    }
+
+    client->write_lock = malloc(sizeof(pthread_mutex_t));
+    if (!client->write_lock){
+        free(client->read_buffer);
+        free(client->write_buffer);
+        free(client->read_lock);
+        return true; 
+    }
+
+    // Inicialización de los locks de los buffers:
+    int err = 0;
+    err += pthread_mutex_init(client->read_lock, NULL);
+    err += pthread_mutex_init(client->write_lock, NULL);
+
+    if (err != 0){
+        free(client->read_buffer);
+        free(client->write_buffer);
+        pthread_mutex_destroy(client->read_lock);
+        free(client->read_lock);
+        pthread_mutex_destroy(client->write_lock);
+        free(client->write_lock);
+        return true;         
+    }
+
+    // Reset de los campos del cliente:
+    client->read_len = 0;
+    client->read_off = 0;
+    client->write_len = 0;
+    client->write_off = 0;
+    client->state = CLIENT_STATE_STANDBY;
+    client->last_action_time = time(NULL);
+
+    return false;
+}
+
+/*
+    @brief Función para liberar correctamente la estructura de un cliente.
+    @note Esta función no considera una conexión activa con el cliente, solo libera recursos de memoria.
+
+    @param struct server_client_conn * client: Referencia a la estructura de conexión de un cliente.
+
+    @retval None.
+*/
+static void ___server_cli_deinit(struct server_client_conn * client){
+    // Comprobación de referencia válida:
+    if (!client) return;
+
+    // Liberación de recursos de la estructura del cliente:
+    free(client->read_buffer);
+    client->read_buffer = NULL;
+    free(client->write_buffer);
+    client->write_buffer = NULL;
+    pthread_mutex_destroy(client->read_lock);
+    free(client->read_lock);
+    client->read_lock = NULL;
+    pthread_mutex_destroy(client->write_lock);
+    free(client->write_lock);
+    client->write_lock = NULL;
+}
+
 /*
     @brief Función para cerrar correctamente la conexión de un cliente conectado.
+    @note Esta función es una ampliación de "deinit" que asume la conexión del cliente.
     @note Libera los recursos en memoria reservados para el cliente pero no la estructura en sí.
 
     @param struct server_client_conn * client_conn: Referencia a la estructura de conexión del cliente.
@@ -976,10 +1077,7 @@ static void ___server_cli_close(struct server_client_conn * client_conn, int epo
 
     close(client_conn->fd);
 
-    free(client_conn->read_buffer);
-    client_conn->read_buffer = NULL;
-    free(client_conn->write_buffer);
-    client_conn->write_buffer = NULL;
+    ___server_cli_deinit(client_conn);
 
     client_conn->state = CLIENT_STATE_STANDBY;
     (*count)--;
