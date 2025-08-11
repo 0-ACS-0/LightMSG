@@ -162,7 +162,7 @@ bool server_deinit(server_pt * server){
     @retval true: Ha ocurrido un error durante el envío.
     @retval false: No han ocurrido errores.
 */
-bool server_broadcast(server_pt server, const char * data, size_t len){
+bool server_broadcast(server_pt server, const char * data, size_t len, int exclude_client_fd){
     // Se comprueba referencias válidas y longitud válida:
     if (!server) return true;
     if (!data) return true;
@@ -175,6 +175,8 @@ bool server_broadcast(server_pt server, const char * data, size_t len){
     for (size_t thread_index = 0; thread_index < server->worker.num_workers; thread_index++){
         for (size_t client_index = 0; client_index < server->worker.client_capacity[thread_index]; client_index++){
             struct server_client_conn * client = &server->worker.client[thread_index][client_index];
+
+            if (client->fd == exclude_client_fd) continue;
 
             if (client->state != CLIENT_STATE_ESTABLISH) continue;
             pthread_mutex_lock(client->write_lock);
@@ -845,13 +847,7 @@ static void * __server_main_worker(void * arg){
             ___server_cli_deinit(&client);
             continue;
         }
-
-        // Se establece el socket del cliente como no bloqueante:
-        if (fcntl(client.fd, F_SETFL, O_NONBLOCK) < 0){
-            close(client.fd);
-            ___server_cli_deinit(&client);
-            continue;
-        }
+        _server_log(logger, LOG_DEBUG, "MAIN WORKER -> Se ha realizado una conexión TCP/IP.");
 
         // Capa TLS para el cliente:
         client.ssl = SSL_new(conn->ssl_ctx);
@@ -860,7 +856,6 @@ static void * __server_main_worker(void * arg){
             ___server_cli_deinit(&client);
             continue;
         }
-
         SSL_set_fd(client.ssl, client.fd);
         if (SSL_accept(client.ssl) <= 0){
             SSL_free(client.ssl);
@@ -868,6 +863,16 @@ static void * __server_main_worker(void * arg){
             ___server_cli_deinit(&client);
             continue;
         }
+        _server_log(logger, LOG_DEBUG, "MAIN WORKER -> Se ha realizado la conexión a través de TLS.");
+
+        // Se establece el socket del cliente como no bloqueante:
+        if (fcntl(client.fd, F_SETFL, O_NONBLOCK) < 0){
+            close(client.fd);
+            ___server_cli_deinit(&client);
+            continue;
+        }
+        _server_log(logger, LOG_DEBUG, "MAIN WORKER -> Se ha establecido el socket cliente como no bloqueante.");
+
 
         // Distribución de la carga del cliente a los hilos de gestión de cliente:
         size_t th_index = 0;
@@ -999,17 +1004,17 @@ static void * __server_cli_worker(void * arg){
                     client->last_action_time = current_time;
 
                     // Procesado de los datos leídos:
-                    if(worker->on_client_rcv) worker->on_client_rcv(client->read_buffer);      // TODO: Desacoplar procesamiento del hilo (ahora, esta función es bloqueante)
+                    if(worker->on_client_rcv) worker->on_client_rcv(client);      // TODO: Desacoplar procesamiento del hilo (ahora, esta función es bloqueante)
                     memset(client->read_buffer, 0, worker->client_read_buffer_size);
 
                     // Log de debug para registrar la lectura de datos del cliente:
-                    _server_log(client_logger, LOG_DEBUG, "Lectura - Se han leído datos del cliente %s:%d", ip_str, port);
+                    _server_log(client_logger, LOG_DEBUG, "Lectura -> Se han leído datos del cliente %s:%d", ip_str, port);
 
                     // Liberación del mutex de lectura:
                     pthread_mutex_unlock(client->read_lock);
                 } else if ((rb == 0) || (SSL_get_error(client->ssl, rb) == SSL_ERROR_ZERO_RETURN)){
                     // Log de info para registrar la desconexión de un cliente:
-                    _server_log(client_logger, LOG_INFO, "Lectura - Se ha desconectado el cliente %s:%d", ip_str, port);
+                    _server_log(client_logger, LOG_INFO, "Lectura -> Se ha desconectado el cliente %s:%d", ip_str, port);
 
                     // Ejecución de función de desconexión:
                     if (worker->on_client_disconnect) worker->on_client_disconnect(client);
@@ -1023,7 +1028,7 @@ static void * __server_cli_worker(void * arg){
                     int ssl_err = SSL_get_error(client->ssl, rb);
                     if ((ssl_err != SSL_ERROR_WANT_READ) && (ssl_err != SSL_ERROR_WANT_WRITE)){
                         // Log de advertencia para registrar un error en un cliente:
-                        _server_log(client_logger, LOG_WARN, "Lectura - Se ha producido un error y se ha forzado la desconexión en el cliente %s:%d", ip_str, port);
+                        _server_log(client_logger, LOG_WARN, "Lectura -> Se ha producido un error y se ha forzado la desconexión en el cliente %s:%d", ip_str, port);
 
                         // Ejecución de función de desconexión:
                         if (worker->on_client_disconnect) worker->on_client_disconnect(client);
@@ -1054,7 +1059,7 @@ static void * __server_cli_worker(void * arg){
                        
                         if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client->fd, &ev) == -1){
                             // Log de advertencia para registrar un error en el cliente:
-                            _server_log(client_logger, LOG_WARN, "Escritura - Se ha producido un error en el cliente %s:%d", ip_str, port);
+                            _server_log(client_logger, LOG_WARN, "Escritura -> Se ha producido un error en el cliente %s:%d", ip_str, port);
 
                             // Ejecución de función de desconexión:
                             if (worker->on_client_disconnect) worker->on_client_disconnect(client);
@@ -1065,10 +1070,10 @@ static void * __server_cli_worker(void * arg){
                         }   
 
                         // Ejecución de función tras envío de datos:
-                        if (worker->on_client_snd) worker->on_client_snd(client);
+                        if (worker->on_client_snd) worker->on_client_snd(&client->write_buffer);
 
                         // Log de debug para registrar la escritura en un cliente:
-                        _server_log(client_logger, LOG_DEBUG, "Escritura - Se han escrito datos al cliente %s:%d", ip_str, port);
+                        _server_log(client_logger, LOG_DEBUG, "Escritura -> Se han escrito datos al cliente %s:%d", ip_str, port);
                     }
                     client->last_action_time = current_time;
 
@@ -1079,7 +1084,7 @@ static void * __server_cli_worker(void * arg){
                     int ssl_err = SSL_get_error(client->ssl, wb);
                     if ((ssl_err != SSL_ERROR_WANT_READ) && (ssl_err != SSL_ERROR_WANT_WRITE)){
                         // Log de advertencia para registrar un error en el cliente:
-                        _server_log(client_logger, LOG_WARN, "Escritura - Se ha producido un error y se ha forzado la desconexión en el cliente %s:%d", ip_str, port);
+                        _server_log(client_logger, LOG_WARN, "Escritura -> Se ha producido un error y se ha forzado la desconexión en el cliente %s:%d", ip_str, port);
 
                         // Ejecución de función de desconexión:
                         if (worker->on_client_disconnect) worker->on_client_disconnect(client);
@@ -1272,7 +1277,7 @@ static void ___server_cli_check_timeout(time_t current_time, struct server_worke
         _server_log(logger, LOG_WARN, "Timeout - Se ha desconectado por inactividad el cliente %s:%d", ip_str, port);
 
         // Ejecución de callback tras timeout:
-        if (worker->on_client_timeout) worker->on_client_timeout(temp_client);
+        if (worker->on_client_timeout) worker->on_client_timeout(&temp_client->last_action_time);
         
         // Desconexión del cliente:
         ___server_cli_close(temp_client, epoll_fd, &worker->client_count[client_ctx->thread_index]);

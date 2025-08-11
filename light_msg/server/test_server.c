@@ -5,12 +5,10 @@ server_pt server;
 
 void at_rcv(void * args){
     // Comprobaciones de seguridad:
-    const char * rcv_buffer = (const char *)args;
-    if (rcv_buffer[0] == ' ') return;
+    client_pt client = (client_pt)args;
 
     // Broadcast a todos los clientes conectados:
-    server_broadcast(server, rcv_buffer, strlen(rcv_buffer));
-    printf("%s\n", rcv_buffer);
+    server_broadcast(server, client->read_buffer, client->read_len, client->fd);
 }
 
 int main(int argc, char ** argv){
@@ -21,7 +19,7 @@ int main(int argc, char ** argv){
         .logger_conf.log_path = "./logs",
         .logger_conf.log_file = "server",
 
-        .conn_conf.port = 2002,
+        .conn_conf.port = 2020,
         .conn_conf.cert_path = "./certs/cert.pem",
         .conn_conf.key_path = "./certs/key.pem",
 

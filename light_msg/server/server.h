@@ -295,6 +295,9 @@ typedef struct server server_t;
 typedef server_t * server_pt;
 typedef struct server_conf server_conf_t;
 typedef server_conf_t * server_conf_pt;
+
+typedef struct server_client_conn client_t;
+typedef client_t * client_pt;
 /* ---------------------------------------------------------------- */
 /* ---------------------------------------------------------------- */
 
@@ -307,7 +310,7 @@ server_pt server_init(server_conf_pt server_conf);
 bool server_open(server_pt server);
 bool server_close(server_pt server);
 bool server_deinit(server_pt * server);
-bool server_broadcast(server_pt server, const char * data, size_t len);
+bool server_broadcast(server_pt server, const char * data, size_t len, int exclude_client_fd);
 /* ---------------------------------------------------------------- */
 /* ---------------------------------------------------------------- */
 
