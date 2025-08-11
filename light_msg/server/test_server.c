@@ -1,17 +1,22 @@
 #include "server.h"
 #include <stdio.h>
 
+server_pt server;
+
 void at_rcv(void * args){
-    struct server_client_conn * client = (struct server_client_conn *)args;
-    if (client->read_buffer[0] == ' ') return;
-    printf("%s\n", client->read_buffer);
+    // Comprobaciones de seguridad:
+    const char * rcv_buffer = (const char *)args;
+    if (rcv_buffer[0] == ' ') return;
+
+    // Broadcast a todos los clientes conectados:
+    server_broadcast(server, rcv_buffer, strlen(rcv_buffer));
+    printf("%s\n", rcv_buffer);
 }
 
 int main(int argc, char ** argv){
-signal(SIGPIPE, SIG_IGN);
 
-    server_pt server = server_init(&(server_conf_t){
-        .logger_conf.log_max_size = 8000,
+    server = server_init(&(server_conf_t){
+        .logger_conf.log_max_size = 8000000,
         .logger_conf.log_min_lvl = 0,
         .logger_conf.log_path = "./logs",
         .logger_conf.log_file = "server",
@@ -20,12 +25,12 @@ signal(SIGPIPE, SIG_IGN);
         .conn_conf.cert_path = "./certs/cert.pem",
         .conn_conf.key_path = "./certs/key.pem",
 
-        .worker_conf.num_workers = 1,
+        .worker_conf.num_workers = 8,
         .worker_conf.client_capacity_block = 2,
         .worker_conf.client_read_buffer_size = 2000,
         .worker_conf.client_write_buffer_size = 2000,
         .worker_conf.client_timeout = 60,
-        .worker_conf.on_client_rcv = at_rcv
+        .worker_conf.on_client_rcv = at_rcv,
     });
 
     server_open(server);

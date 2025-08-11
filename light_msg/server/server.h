@@ -43,7 +43,7 @@
 /* ---- Definiciones/Macros --------------------------------------- */
 #define DEFAULT_LOG_PATH                    "./logs"
 #define DEFAULT_LOG_FILE                    "server"
-#define DEFAULT_LOG_FILE_SIZE               10000
+#define DEFAULT_LOG_FILE_SIZE               10000000
 #define DEFAULT_LOG_MIN_LVL                 0
 #define MAX_LOG_ROUTE_LEN                   255
 #define LOG_RESERVED_FORMAT_LEN             128
@@ -240,6 +240,9 @@ struct server_worker{
     time_t client_timeout;
 
     // Funciones a realizar sobre los datos de los clientes:
+    void (*on_client_connect)(void * args);
+    void (*on_client_disconnect)(void * args);
+    void (*on_client_timeout)(void * args);
     void (*on_client_rcv)(void * args);
     void (*on_client_snd)(void * args);
 };
@@ -258,6 +261,9 @@ struct server_worker_conf{
     time_t client_timeout;
 
     // Configuración de las funciones de procesado de datos de los clientes:
+    void (*on_client_connect)(void * args);
+    void (*on_client_disconnect)(void * args);
+    void (*on_client_timeout)(void * args);
     void (*on_client_rcv)(void * args);
     void (*on_client_snd)(void * args);
 };
@@ -301,6 +307,7 @@ server_pt server_init(server_conf_pt server_conf);
 bool server_open(server_pt server);
 bool server_close(server_pt server);
 bool server_deinit(server_pt * server);
+bool server_broadcast(server_pt server, const char * data, size_t len);
 /* ---------------------------------------------------------------- */
 /* ---------------------------------------------------------------- */
 

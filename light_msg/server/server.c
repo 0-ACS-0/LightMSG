@@ -1,10 +1,4 @@
 #include "server.h"
-#include <netinet/in.h>
-#include <pthread.h>
-#include <string.h>
-#include <sys/epoll.h>
-#include <sys/socket.h>
-
 
 /* -------------------------------------------------------------------------------------------------------------------------------- */
 /* ---- Prototipo de funciones estáticas ------------------------------------------------------------------------------------------ */
@@ -68,8 +62,11 @@ server_pt server_init(server_conf_pt server_conf){
         return NULL;
     }
 
+    // Se ignora la señal SIGPIPE (generada automáticamente por la librería openssl):
+    signal(SIGPIPE, SIG_IGN);
+
     // Estado de servidor inicializado:
-    _server_log(&server->logger, LOG_DEBUG, "Servidor inicializado correctamente en (%p).", server);
+    _server_log(&server->logger, LOG_INFO, "Servidor inicializado correctamente en (%p).", server);
     server->state = SERVER_STATE_INITIALIZED;
     return server;
 }
@@ -152,6 +149,61 @@ bool server_deinit(server_pt * server){
     free(*server);
     *server = NULL;
 
+    return false;
+}
+
+/*
+    @brief Función del servidor para enviar datos a todos los clientes conectados.
+
+    @param server_pt server: Referencia al servidor.
+    @param const char * data: Referencia a la cadena de datos a enviar.
+    @param size_t len: Longitud de la cadena de datos a enviar.
+
+    @retval true: Ha ocurrido un error durante el envío.
+    @retval false: No han ocurrido errores.
+*/
+bool server_broadcast(server_pt server, const char * data, size_t len){
+    // Se comprueba referencias válidas y longitud válida:
+    if (!server) return true;
+    if (!data) return true;
+    if ((len == 0) || (len > server->worker.client_write_buffer_size)) return true;
+
+    // Lock para proteger de posibles desplazamientos en memoria:
+    pthread_mutex_lock(&server->worker.realloc_lock);
+
+    // Se recorren todos los clientes conectados, y se establece el envío del mensaje:
+    for (size_t thread_index = 0; thread_index < server->worker.num_workers; thread_index++){
+        for (size_t client_index = 0; client_index < server->worker.client_capacity[thread_index]; client_index++){
+            struct server_client_conn * client = &server->worker.client[thread_index][client_index];
+
+            if (client->state != CLIENT_STATE_ESTABLISH) continue;
+            pthread_mutex_lock(client->write_lock);
+            if (client->write_len > 0) {
+                pthread_mutex_unlock(client->write_lock);
+                continue;
+            }
+
+            // Copia de datos en el buffer de escritura:
+            memcpy(client->write_buffer, data, len);
+            client->write_len = len;
+            client->write_off = 0;
+
+            // Se establece epoll para eventos de salida de datos:
+            struct epoll_event event;
+            event.events = EPOLLIN | EPOLLOUT;
+            event.data.u64 = client_index;
+            if (epoll_ctl(server->worker.epoll_fd[thread_index], EPOLL_CTL_MOD, client->fd, &event) == -1 ){
+                client->write_len = 0;
+                client->write_off = 0;
+                pthread_mutex_unlock(client->write_lock);
+                continue;
+            }
+
+            pthread_mutex_unlock(client->write_lock);
+        }
+    }
+
+    pthread_mutex_unlock(&server->worker.realloc_lock);
     return false;
 }
 /* -------------------------------------------------------------------------------------------------------------------------------- */
@@ -540,8 +592,8 @@ static void _server_conn_deinit(struct server_conn * conn){
 // ================================================================ //
 // Worker.
 // ================================================================ //
-static void * __server_main_worker(void * arg);
-static void * __server_cli_worker(void * arg);
+static void * __server_main_worker(void * arg);     // Hilo principal de gestión de conexiones. (Implementado en el apartado 'Hilos de gestión del servidor.'.)
+static void * __server_cli_worker(void * arg);      // Hilo secundario de gestión de clientes. (Implementado en el apartado 'Hilos de gestión del servidor.'.)
 
 /*
     @brief Función para crear y configurar parámetros básicos de los hilos de trabajo del servidor.
@@ -558,13 +610,8 @@ static bool _server_worker_conf(struct server_worker * worker, struct server_wor
     if (worker == NULL) return true;
     if (worker_conf == NULL) return true;
 
-    // Se aseguran que los punteros sean inválidos:
-    worker->client_ctx = NULL;
-    worker->client_capacity = NULL;
-    worker->client_count = NULL;
-    worker->client = NULL;
-    worker->epoll_fd = NULL;
-    worker->thread = NULL;
+    // Se deja a 0 la estructura:
+    memset(worker, 0, sizeof(struct server_worker));
 
     // Asignación de valores configurados (o por defecto si no se dan - miembros estáticos):
     worker->num_workers = (worker_conf->num_workers > 0) ? worker_conf->num_workers : DEFAULT_NUM_WORKERS;
@@ -572,10 +619,26 @@ static bool _server_worker_conf(struct server_worker * worker, struct server_wor
     worker->client_read_buffer_size = (worker_conf->client_read_buffer_size > 0) ? worker_conf->client_read_buffer_size : DEFAULT_CLIENT_READ_BUFFER_SIZE;
     worker->client_write_buffer_size = (worker_conf->client_write_buffer_size > 0) ? worker_conf->client_write_buffer_size : DEFAULT_CLIENT_WRITE_BUFFER_SIZE;
     worker->client_timeout = (worker_conf->client_timeout > 0) ? worker_conf->client_timeout : DEFAULT_CLIENT_TIMEOUT;
+    worker->on_client_connect = worker_conf->on_client_connect;
+    worker->on_client_disconnect = worker_conf->on_client_disconnect;
+    worker->on_client_timeout = worker_conf->on_client_timeout;
     worker->on_client_rcv = worker_conf->on_client_rcv;
     worker->on_client_snd = worker->on_client_snd;
 
-    if (pthread_mutex_init(&worker->realloc_lock, NULL) != 0) return true;
+
+    // Inicialización del mutex realloc_lock como mutex recursivo (para evitar deadlocks en un mismo hilo):
+    pthread_mutexattr_t realloc_attr;
+    if (pthread_mutexattr_init(&realloc_attr) != 0) return true;
+    if (pthread_mutexattr_settype(&realloc_attr, PTHREAD_MUTEX_RECURSIVE) != 0){
+        pthread_mutexattr_destroy(&realloc_attr);
+        return true;
+    }
+    if (pthread_mutex_init(&worker->realloc_lock, &realloc_attr) != 0){
+        pthread_mutexattr_destroy(&realloc_attr);
+        return true;  
+    }
+    pthread_mutexattr_destroy(&realloc_attr);
+
 
     // Asignación de valores configurados (o por defecto - miembros dinámicos):
     worker->client_ctx = malloc(sizeof(struct server_client_ctx) * worker->num_workers);
@@ -740,12 +803,13 @@ static void _server_worker_wait_land(struct server_worker * worker){
 }
 
 // ================================================================ //
-// Hilos de gestión del servidor.
+// Hilos de gestión del servidor.   -   Funciones internas.
 // ================================================================ //
+// Funciones internas de las funciones internas para gestión de clientes. (Implementado en 'Funciones auxiliares para los clientes.'.)
 static bool ___server_cli_init(struct server_client_conn * client, size_t read_buffer_len, size_t write_buffer_len);
 static void ___server_cli_deinit(struct server_client_conn * client);
 static void ___server_cli_close(struct server_client_conn * client_conn, int epoll_fd, size_t * count);
-static void ___server_cli_check_timeout(time_t current_time, struct server_worker * worker, int epoll_fd, struct server_client_ctx * client_ctx, struct server_client_conn * clients);
+static void ___server_cli_check_timeout(time_t current_time, struct server_worker * worker, int epoll_fd, struct server_client_ctx * client_ctx, struct server_client_conn * clients, struct server_logger * logger);
 
 /*
     @brief Esta función es el hilo principal del servidor, gestiona las conexiones con los clientes y su distribución en los hilos de gestión de clientes.
@@ -870,6 +934,9 @@ static void * __server_main_worker(void * arg){
             continue;
         }
 
+        // Ejecución de función tras conexión de cliente:
+        if (worker->on_client_connect) worker->on_client_connect(&worker->client[th_index][pos_index]);
+
         // Loggin e impresión de datos del cliente conectado:
         char ip_str[INET_ADDRSTRLEN] = {0};
         if (inet_ntop(AF_INET, &client.addr.sin_addr, ip_str, sizeof(ip_str)) == NULL) ip_str[0] = '?';
@@ -932,7 +999,7 @@ static void * __server_cli_worker(void * arg){
                     client->last_action_time = current_time;
 
                     // Procesado de los datos leídos:
-                    if(worker->on_client_rcv) worker->on_client_rcv(client);      // TODO: Desacoplar procesamiento del hilo (ahora, esta función es bloqueante)
+                    if(worker->on_client_rcv) worker->on_client_rcv(client->read_buffer);      // TODO: Desacoplar procesamiento del hilo (ahora, esta función es bloqueante)
                     memset(client->read_buffer, 0, worker->client_read_buffer_size);
 
                     // Log de debug para registrar la lectura de datos del cliente:
@@ -944,6 +1011,9 @@ static void * __server_cli_worker(void * arg){
                     // Log de info para registrar la desconexión de un cliente:
                     _server_log(client_logger, LOG_INFO, "Lectura - Se ha desconectado el cliente %s:%d", ip_str, port);
 
+                    // Ejecución de función de desconexión:
+                    if (worker->on_client_disconnect) worker->on_client_disconnect(client);
+
                     // Caso cierre de conexión por parte del cliente:
                     pthread_mutex_unlock(client->read_lock);
                     ___server_cli_close(client, epoll_fd, &worker->client_count[client_ctx->thread_index]);
@@ -953,7 +1023,10 @@ static void * __server_cli_worker(void * arg){
                     int ssl_err = SSL_get_error(client->ssl, rb);
                     if ((ssl_err != SSL_ERROR_WANT_READ) && (ssl_err != SSL_ERROR_WANT_WRITE)){
                         // Log de advertencia para registrar un error en un cliente:
-                        _server_log(client_logger, LOG_WARN, "Lectura - Se ha producido un error en el cliente %s:%d", ip_str, port);
+                        _server_log(client_logger, LOG_WARN, "Lectura - Se ha producido un error y se ha forzado la desconexión en el cliente %s:%d", ip_str, port);
+
+                        // Ejecución de función de desconexión:
+                        if (worker->on_client_disconnect) worker->on_client_disconnect(client);
 
                         pthread_mutex_unlock(client->read_lock);
                         ___server_cli_close(client, epoll_fd, &worker->client_count[client_ctx->thread_index]);
@@ -983,10 +1056,16 @@ static void * __server_cli_worker(void * arg){
                             // Log de advertencia para registrar un error en el cliente:
                             _server_log(client_logger, LOG_WARN, "Escritura - Se ha producido un error en el cliente %s:%d", ip_str, port);
 
+                            // Ejecución de función de desconexión:
+                            if (worker->on_client_disconnect) worker->on_client_disconnect(client);
+
                             pthread_mutex_unlock(client->write_lock);
                             ___server_cli_close(client, epoll_fd, &worker->client_count[client_ctx->thread_index]);
                             continue;
                         }   
+
+                        // Ejecución de función tras envío de datos:
+                        if (worker->on_client_snd) worker->on_client_snd(client);
 
                         // Log de debug para registrar la escritura en un cliente:
                         _server_log(client_logger, LOG_DEBUG, "Escritura - Se han escrito datos al cliente %s:%d", ip_str, port);
@@ -1000,7 +1079,10 @@ static void * __server_cli_worker(void * arg){
                     int ssl_err = SSL_get_error(client->ssl, wb);
                     if ((ssl_err != SSL_ERROR_WANT_READ) && (ssl_err != SSL_ERROR_WANT_WRITE)){
                         // Log de advertencia para registrar un error en el cliente:
-                        _server_log(client_logger, LOG_WARN, "Escritura - Se ha producido un error en el cliente %s:%d", ip_str, port);
+                        _server_log(client_logger, LOG_WARN, "Escritura - Se ha producido un error y se ha forzado la desconexión en el cliente %s:%d", ip_str, port);
+
+                        // Ejecución de función de desconexión:
+                        if (worker->on_client_disconnect) worker->on_client_disconnect(client);
 
                         pthread_mutex_unlock(client->write_lock);
                         ___server_cli_close(client, epoll_fd, &worker->client_count[client_ctx->thread_index]);
@@ -1011,7 +1093,7 @@ static void * __server_cli_worker(void * arg){
 
         }
         // Verificación de los timeout de los clientes conectados tras una operación:
-        ___server_cli_check_timeout(current_time, worker, epoll_fd, client_ctx, worker->client[client_ctx->thread_index]);
+        ___server_cli_check_timeout(current_time, worker, epoll_fd, client_ctx, worker->client[client_ctx->thread_index], client_logger);
 
         // Se libera el mutex de realojamiento de memoria:
         pthread_mutex_unlock(&worker->realloc_lock);
@@ -1026,7 +1108,7 @@ static void * __server_cli_worker(void * arg){
 }
 
 // ================================================================ //
-// Funciones auxiliares para los clientes.
+// Funciones auxiliares para los clientes.  -   Funciones internas.
 // ================================================================ //
 /*
     @brief Función para alojar memoria e inicializar a 0's la estructura de un cliente.
@@ -1173,12 +1255,26 @@ static void ___server_cli_close(struct server_client_conn * client_conn, int epo
 
     @retval None.
 */
-static void ___server_cli_check_timeout(time_t current_time, struct server_worker * worker, int epoll_fd, struct server_client_ctx * client_ctx, struct server_client_conn * clients){
+static void ___server_cli_check_timeout(time_t current_time, struct server_worker * worker, int epoll_fd, struct server_client_ctx * client_ctx, struct server_client_conn * clients, struct server_logger * logger){
+    // Variable locale para registrar desconexiones en el logger:
+    char ip_str[INET_ADDRSTRLEN] = {0};
+    int port;
+
     // Verificación de los timeouts:
     for (size_t i = 0; i < worker->client_capacity[client_ctx->thread_index]; i++){
         struct server_client_conn * temp_client = &clients[i];
         if (temp_client->state != CLIENT_STATE_ESTABLISH) continue;
         if (difftime(current_time, temp_client->last_action_time) <= worker->client_timeout) continue;
+        
+        // Registro de timeout y desconexión del cliente:
+        if (inet_ntop(AF_INET, &temp_client->addr.sin_addr, ip_str, sizeof(ip_str)) == NULL) ip_str[0] = '?';
+        port = ntohs(temp_client->addr.sin_port);
+        _server_log(logger, LOG_WARN, "Timeout - Se ha desconectado por inactividad el cliente %s:%d", ip_str, port);
+
+        // Ejecución de callback tras timeout:
+        if (worker->on_client_timeout) worker->on_client_timeout(temp_client);
+        
+        // Desconexión del cliente:
         ___server_cli_close(temp_client, epoll_fd, &worker->client_count[client_ctx->thread_index]);
     }
 }
