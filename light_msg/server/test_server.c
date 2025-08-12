@@ -8,7 +8,7 @@ void at_rcv(void * args){
     client_pt client = (client_pt)args;
 
     // Broadcast a todos los clientes conectados:
-    server_broadcast(server, client->read_buffer, client->read_len, client->fd);
+    server_broadcast(server, client->read_buffer, client->read_len, NULL);
 }
 
 int main(int argc, char ** argv){
@@ -24,9 +24,9 @@ int main(int argc, char ** argv){
         .conn_conf.key_path = "./certs/key.pem",
 
         .worker_conf.num_workers = 8,
-        .worker_conf.client_capacity_block = 2,
-        .worker_conf.client_read_buffer_size = 2000,
-        .worker_conf.client_write_buffer_size = 2000,
+        .worker_conf.client_capacity_block = 20,
+        .worker_conf.client_read_buffer_size = 4096,
+        .worker_conf.client_write_buffer_size = 4096,
         .worker_conf.client_timeout = 60,
         .worker_conf.on_client_rcv = at_rcv,
     });

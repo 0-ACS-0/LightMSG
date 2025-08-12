@@ -162,7 +162,7 @@ bool server_deinit(server_pt * server){
     @retval true: Ha ocurrido un error durante el envío.
     @retval false: No han ocurrido errores.
 */
-bool server_broadcast(server_pt server, const char * data, size_t len, int exclude_client_fd){
+bool server_broadcast(server_pt server, const char * data, size_t len, int * exclude_client_fd){
     // Se comprueba referencias válidas y longitud válida:
     if (!server) return true;
     if (!data) return true;
@@ -176,7 +176,7 @@ bool server_broadcast(server_pt server, const char * data, size_t len, int exclu
         for (size_t client_index = 0; client_index < server->worker.client_capacity[thread_index]; client_index++){
             struct server_client_conn * client = &server->worker.client[thread_index][client_index];
 
-            if (client->fd == exclude_client_fd) continue;
+            if (exclude_client_fd && (client->fd == *exclude_client_fd)) continue;
 
             if (client->state != CLIENT_STATE_ESTABLISH) continue;
             pthread_mutex_lock(client->write_lock);
@@ -1274,7 +1274,7 @@ static void ___server_cli_check_timeout(time_t current_time, struct server_worke
         // Registro de timeout y desconexión del cliente:
         if (inet_ntop(AF_INET, &temp_client->addr.sin_addr, ip_str, sizeof(ip_str)) == NULL) ip_str[0] = '?';
         port = ntohs(temp_client->addr.sin_port);
-        _server_log(logger, LOG_WARN, "Timeout - Se ha desconectado por inactividad el cliente %s:%d", ip_str, port);
+        _server_log(logger, LOG_WARN, "Timeout -> Se ha desconectado por inactividad el cliente %s:%d", ip_str, port);
 
         // Ejecución de callback tras timeout:
         if (worker->on_client_timeout) worker->on_client_timeout(&temp_client->last_action_time);
